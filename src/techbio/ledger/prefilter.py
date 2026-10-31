@@ -65,6 +65,9 @@ SAFE_HARBOR_INLINE = re.compile(
     r"Private Securities Litigation Reform Act|forward-looking statements within the meaning", re.I
 )
 MAX_EXCERPT_CHARS = 16_000
+# Characters XML forbids. lxml decodes entities such as &#11; (Word's soft line break, common in
+# EDGAR exhibits) but will not write them back into the tree, so they become spaces.
+XML_UNSAFE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 
 
 def html_to_text(raw: bytes) -> str:
@@ -73,7 +76,7 @@ def html_to_text(raw: bytes) -> str:
         bad.drop_tree()
     for el in doc.iter():
         if isinstance(el.tag, str) and el.tag.lower() in BLOCK_TAGS:
-            el.tail = "\n" + (el.tail or "")
+            el.tail = "\n" + XML_UNSAFE.sub(" ", el.tail or "")
     text = doc.text_content()
     text = text.replace("\xa0", " ")
     lines = [" ".join(line.split()) for line in text.split("\n")]

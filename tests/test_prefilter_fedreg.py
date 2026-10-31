@@ -16,6 +16,19 @@ def test_prefilter_strips_safe_harbor_and_builds_excerpt():
     assert "Forward-Looking Statements" not in res.excerpt
 
 
+def test_html_to_text_survives_control_character_entities():
+    # EDGAR exhibits exported from Word carry soft line breaks as &#11; (vertical tab), which lxml
+    # decodes but refuses to write back into the tree. Seen in 6 real EX-99 releases (2026-10-31).
+    raw = (
+        b"<html><body><div><p>The Phase 3 SUMMIT trial</p>&#11;topline data are expected"
+        b"&#11;in mid-2027.<p>Next paragraph</p>&#12;after a form feed</div></body></html>"
+    )
+    text = prefilter.html_to_text(raw)
+    assert "topline data are expected in mid-2027." in text
+    assert "after a form feed" in text
+    assert not any(c in text for c in "\x0b\x0c")
+
+
 def test_prefilter_fails_unrelated_release():
     assert not prefilter.run(
         "Example Therapeutics announces new board member.\n\nShe joins from a bank."
