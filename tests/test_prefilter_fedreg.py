@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from techbio.ledger import prefilter
+from techbio.ledger.quotes import match_quote
 from techbio.ledger.sources.fedreg import parse_notice
 
 FIX = Path(__file__).parent / "fixtures"
@@ -23,9 +24,9 @@ def test_prefilter_fails_unrelated_release():
 
 def test_quote_verification_is_verbatim_modulo_whitespace_and_quotes():
     text = "Topline data are expected in the first half of 2027."
-    assert prefilter.quote_in("Topline data are expected in the  first half of 2027", text)
-    assert not prefilter.quote_in("Topline data are expected in H1 2027", text)
-    assert not prefilter.quote_in("short", text)
+    assert match_quote("Topline data are expected in the  first half of 2027", text).accepted
+    assert not match_quote("Topline data are expected in H1 2027", text).accepted
+    assert not match_quote("short", text).accepted
 
 
 SYNTHETIC_NOTICE = """

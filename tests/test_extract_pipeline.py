@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from techbio.core.db import events, labels, promises, resolutions, review_queue
+from techbio.core.db import events, labels, promises, quote_checks, resolutions, review_queue
 from techbio.core.llm import runner
 from techbio.core.llm.cache import LLMResponse
 from techbio.ledger.extract import run_extraction
+from techbio.ledger.quotes import drop_sample
+from techbio.ledger.report import summary
 from techbio.ledger.review import decide, open_items, queue_size
 
 from .conftest import add_source
@@ -36,6 +38,7 @@ def st(**kw):
         "result_category": None,
         "result_subtype": None,
         "sponsor_explanation_category": None,
+        "stop_data_trigger": None,
         "quote": "Topline data are expected in the first half of 2027.",
         "confidence": 0.95,
     }
@@ -44,6 +47,9 @@ def st(**kw):
 
 
 SUMMIT_Q = "The Company remains on track to report topline results from the Phase 2b SUMMIT trial in mid-2027."
+SUMMIT_NEAR = (
+    "The Company is on track to report topline results from the Phase 2b SUMMIT trial in mid-2027."
+)
 SUMMIT = dict(
     asset_name="EXT-202",
     asset_aliases=[],
@@ -124,7 +130,8 @@ def answers(model_key, req):
             )
         )  # not in the document
     else:
-        out.append(st(**SUMMIT, timing_text="second half of 2027"))
+        # Near-verbatim ("remains" -> "is"): kept under the fuzzy rule, and still paired with A.
+        out.append(st(**{**SUMMIT, "quote": SUMMIT_NEAR}, timing_text="second half of 2027"))
     return {"statements": out}
 
 
@@ -143,7 +150,8 @@ def test_pipeline_routes_agree_tiebreak_queue_and_review(engine, sponsor, fake, 
         engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
     )
     out = run_extraction(engine, execute=True)
-    assert out["accepted"] == 2 and out["tiebreaks"] == 1 and out["quote_dropped"] == 1
+    assert out["accepted"] == 2 and out["tiebreaks"] == 1
+    assert (out["quote_dropped"], out["quote_fuzzy"]) == (1, 1)
 
     with engine.connect() as c:
         evs = {e["trial_name"]: e for e in c.execute(select(events)).mappings()}
@@ -211,3 +219,38 @@ def test_rerun_is_free(engine, sponsor, fake, tmp_path):
     out = run_extraction(engine, execute=True)
     assert len(f.calls) == n
     assert out["spend"]["actual_usd"] == 0 and out["spend"]["n_cached"] > 0
+
+
+def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake, tmp_path):
+    fake(answers)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    run_extraction(engine, execute=True)
+    with engine.connect() as c:
+        rows = c.execute(select(quote_checks)).mappings().all()
+    ext = [r for r in rows if r["role"] == "extractor"]
+    assert len(ext) == 5  # A reported 3 statements, B 2
+    assert sorted(r["method"] for r in ext) == ["exact", "exact", "exact", "fuzzy", "rejected"]
+    (drop,) = [r for r in ext if not r["accepted"]]
+    assert drop["claimed_quote"].startswith("EXT-303") and drop["matched_span"]
+    assert drop["reject_reason"] in ("below_threshold", "identifier_mismatch")
+    assert drop["threshold"] == 0.8
+    (fuzzy,) = [r for r in ext if r["method"] == "fuzzy"]
+    assert fuzzy["matched_span"].startswith("The Company remains on track")
+    assert [r["role"] for r in rows if r["role"] != "extractor"] == ["tiebreak"]
+
+    q = summary(engine)["quote_checks"]
+    assert (q["checked"], q["dropped"], q["fuzzy_kept"]) == (5, 1, 1)
+    assert q["per_document"] == [
+        {
+            "source_id": "src_1",
+            "url": "https://www.sec.gov/Archives/src_1.htm",
+            "checked": 5,
+            "dropped": 1,
+            "drop_rate": 0.2,
+        }
+    ]
+    (s,) = drop_sample(engine, n=10)
+    assert s["claimed_quote"] == drop["claimed_quote"] and s["nearest_span"] == drop["matched_span"]
+    assert s["url"].endswith("src_1.htm") and s["model_key"] == "extractor_a"

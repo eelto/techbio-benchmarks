@@ -152,18 +152,3 @@ def run(text: str) -> PrefilterResult:
             break
     excerpt = "\n\n".join(paras[i] for i in sorted(keep))
     return PrefilterResult(True, hits, excerpt, full)
-
-
-_QUOTE_MAP = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", " ": " "})
-
-
-def _norm(s: str) -> str:
-    return " ".join(s.translate(_QUOTE_MAP).split())
-
-
-def quote_in(quote: str | None, text: str) -> bool:
-    """True if the quote appears verbatim in the text, modulo whitespace, curly quotes and dashes."""
-    if not quote or len(quote.strip()) < 12:
-        return False
-    q = _norm(quote).strip(" .\"'")
-    return q in _norm(text)

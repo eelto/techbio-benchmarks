@@ -3,15 +3,16 @@
 Per document:
 1. The free prefilter builds the excerpt (sources that fail it never reach a model).
 2. Extractors A and B (two vendors, cheap tier, batch) each return statements.
-3. A statement whose quote is not verbatim in the document is dropped (its rows are kept with
-   quote_verified = false).
+3. Each statement's quote is checked against the document (ledger/quotes.py): exact and
+   near-verbatim quotes are kept; the rest are dropped, and every check is logged in quote_checks
+   with the claimed quote and the nearest source span (drop rate and a sample go in the summary).
 4. Statements are paired across models by event type, asset and trial.
 5. Routing per pair:
    - all compared fields agree, and reserved-field confidence >= tau -> auto-accept;
    - a non-reserved field disagrees, or only one model found the statement -> the tie-break model
      (third vendor) must pick A or B; "neither" goes to the queue;
-   - a reserved field (result category, stop subtype, explanation category) disagrees or has low
-     confidence -> human queue. Models never break ties on reserved fields.
+   - a reserved field (result category, stop subtype, data trigger, explanation category) disagrees
+     or has low confidence -> human queue. Models never break ties on reserved fields.
 """
 
 from __future__ import annotations
@@ -35,11 +36,14 @@ from techbio.core.spend import DryRun, SpendGuard
 from techbio.ledger import prefilter
 from techbio.ledger.apply import Provenance, Statement, apply_statement
 from techbio.ledger.names import assets_overlap
+from techbio.ledger.quotes import QuoteMatch, match_quote, record_check
 from techbio.ledger.sources.ctgov import parse_study, stop_document
 from techbio.ledger.taxonomy import (
     ALL_RESULTS,
+    DATA_TRIGGERS,
     EXPLANATIONS,
     RESERVED_CONFIDENCE_TAU,
+    RESERVED_FIELDS,
     STOP_SUBTYPES,
 )
 from techbio.ledger.timing import iso_or_none, parse_timing
@@ -48,7 +52,7 @@ console = Console(stderr=True)
 PROMPT_VERSION = "extract_v1"
 EXTRACTORS = ("extractor_a", "extractor_b")
 TIEBREAK = "tiebreak"
-RESERVED = ("result_category", "result_subtype", "sponsor_explanation_category")
+RESERVED = RESERVED_FIELDS
 COMPARED = ("kind", "phase", "application_kind", "nct_id", "window", "event_date", *RESERVED)
 TIEBREAK_SHARE = 0.2  # planning assumption until the pilot measures it
 
@@ -77,6 +81,7 @@ STATEMENT_SCHEMA: dict[str, Any] = {
         "result_category",
         "result_subtype",
         "sponsor_explanation_category",
+        "stop_data_trigger",
         "quote",
         "confidence",
     ],
@@ -103,6 +108,7 @@ STATEMENT_SCHEMA: dict[str, Any] = {
         "result_category": _nullable_enum(ALL_RESULTS),
         "result_subtype": _nullable_enum(STOP_SUBTYPES),
         "sponsor_explanation_category": _nullable_enum(EXPLANATIONS),
+        "stop_data_trigger": _nullable_enum(DATA_TRIGGERS),
         "quote": {"type": "string"},
         "confidence": {"type": "number"},
     },
@@ -257,7 +263,11 @@ class Cand:
     raw: dict[str, Any]
     st: Statement
     confidence: float
-    quote_ok: bool
+    qm: QuoteMatch
+
+    @property
+    def quote_ok(self) -> bool:
+        return self.qm.accepted
 
 
 def to_statement(raw: dict[str, Any], statement_date: date) -> Statement:
@@ -286,6 +296,9 @@ def to_statement(raw: dict[str, Any], statement_date: date) -> Statement:
         if raw.get("result_category") == "stopped"
         else None,
         sponsor_explanation_category=raw.get("sponsor_explanation_category"),
+        stop_data_trigger=raw.get("stop_data_trigger")
+        if raw.get("result_category") == "stopped"
+        else None,
         quote=raw.get("quote"),
     )
 
@@ -310,7 +323,7 @@ def parse_candidates(model_key: str, resp: LLMResponse | None, doc: Doc) -> list
                 raw,
                 st,
                 float(raw.get("confidence") or 0.0),
-                prefilter.quote_in(raw.get("quote"), doc.full_text),
+                match_quote(raw.get("quote"), doc.full_text),
             )
         )
     return out
@@ -455,6 +468,8 @@ def _accept(
     prov = Provenance(
         doc.src["source_id"], doc.src["sponsor_id"], doc.statement_date, reviewer, reviewer_kind
     )
+    if doc.src["type"] == "ctgov" and not st.nct_id:
+        st.nct_id = doc.src["meta"].get("nct_id")  # the registry record is that trial
     res = apply_statement(conn, st, prov)
     if res.ambiguous:
         _queue(
@@ -523,6 +538,7 @@ def run_extraction(
         "events_created": 0,
         "resolved": 0,
         "quote_dropped": 0,
+        "quote_fuzzy": 0,
     }
     try:
         responses: dict[str, dict[str, LLMResponse]] = {}
@@ -548,7 +564,20 @@ def run_extraction(
             cb = parse_candidates(EXTRACTORS[1], got[EXTRACTORS[1]], d)
             with engine.begin() as conn:
                 _write_extraction_rows(conn, run, d, ca + cb, keys[sid])
+                for c in ca + cb:
+                    record_check(
+                        conn,
+                        c.qm,
+                        run_id=run,
+                        source_id=sid,
+                        model_key=c.model_key,
+                        role="extractor",
+                        claimed_quote=c.raw.get("quote"),
+                        statement_idx=c.idx,
+                        statement=c.st.to_json(),
+                    )
                 stats["quote_dropped"] += sum(1 for c in ca + cb if not c.quote_ok)
+                stats["quote_fuzzy"] += sum(1 for c in ca + cb if c.qm.method == "fuzzy")
                 for a, b in pair([c for c in ca if c.quote_ok], [c for c in cb if c.quote_ok]):
                     if a and b:
                         disputed = disputed_fields(a.st, b.st)
@@ -665,11 +694,21 @@ def _run_tiebreaks(
             ok = True
             for f in disputed:
                 c = choices.get(f)
-                if (
-                    c is None
-                    or c["choice"] == "neither"
-                    or not prefilter.quote_in(c.get("quote"), d.full_text)
-                ):
+                if c is None or c["choice"] == "neither":
+                    ok = False
+                    break
+                qm = match_quote(c.get("quote"), d.full_text)
+                record_check(
+                    conn,
+                    qm,
+                    run_id=run,
+                    source_id=d.src["source_id"],
+                    model_key=TIEBREAK,
+                    role="tiebreak",
+                    claimed_quote=c.get("quote"),
+                    field=f,
+                )
+                if not qm.accepted:
                     ok = False
                     break
                 if f == "exists":

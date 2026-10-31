@@ -3,7 +3,8 @@
 Each item shows the event, both model answers (and the tie-break's, if any), confidences, and the
 exact supporting passages from the local copy of the source, with its link. The operator picks A or
 B, types a value, links to an existing event, or skips. The decision is written as a new label
-version (`human:<reviewer>`) through the same apply path as automatic decisions.
+version (`human:<reviewer>`) through the same apply path as automatic decisions. `exclusion_link`
+items (a withdrawn trial citing another trial without its NCT number) ask which trial it cites.
 """
 
 from __future__ import annotations
@@ -19,14 +20,16 @@ from rich.table import Table
 from sqlalchemy import Engine, func, select, update
 
 from techbio.core.db import now, review_queue, sources
-from techbio.ledger import prefilter
+from techbio.ledger import exclusions, prefilter
 from techbio.ledger.apply import Provenance, Statement, apply_statement
-from techbio.ledger.taxonomy import ALL_RESULTS, EXPLANATIONS, STOP_SUBTYPES
+from techbio.ledger.quotes import match_quote
+from techbio.ledger.taxonomy import ALL_RESULTS, DATA_TRIGGERS, EXPLANATIONS, STOP_SUBTYPES
 
 ALLOWED = {
     "result_category": ALL_RESULTS,
     "result_subtype": STOP_SUBTYPES,
     "sponsor_explanation_category": EXPLANATIONS,
+    "stop_data_trigger": DATA_TRIGGERS,
 }
 
 
@@ -47,13 +50,16 @@ def _passage(src_path: str, content_type: str | None, quote: str | None, width: 
         return "(no quote)"
     text = prefilter.load_text(src_path, content_type)
     norm = " ".join(text.split())
-    q = " ".join(quote.split())
-    i = norm.find(q[:60])
+    m = match_quote(quote, text)
+    i = norm.find(m.span) if m.span else -1
     if i < 0:
-        return f"(quote not found verbatim) {quote}"
+        return f"(quote not found) {quote}"
+    label = "" if m.method == "exact" else f"[dim](near-verbatim, score {m.score:.2f})[/] "
+    q = m.span
     start = max(0, i - width // 2)
     return (
-        "…"
+        label
+        + "…"
         + norm[start:i]
         + "[bold yellow]"
         + norm[i : i + len(q)]
@@ -67,10 +73,16 @@ def render(console: Console, item: dict[str, Any], src: dict[str, Any]) -> None:
     p = item["payload"]
     console.rule(f"[bold]{item['reason']}[/] · field: {item['field']} · {item['item_id']}")
     st = p.get("statement", {})
-    console.print(
-        f"[bold]{st.get('event_type')}[/] · {st.get('asset_name')} · {st.get('indication') or ''} · "
-        f"trial {st.get('trial_name') or st.get('nct_id') or '?'} · kind {st.get('kind')}"
-    )
+    if item["reason"] == "exclusion_link":
+        console.print(
+            f"[bold]{p['nct_id']}[/] was withdrawn before enrolling and cites another trial"
+        )
+    else:
+        console.print(
+            f"[bold]{st.get('event_type')}[/] · {st.get('asset_name')} · "
+            f"{st.get('indication') or ''} · "
+            f"trial {st.get('trial_name') or st.get('nct_id') or '?'} · kind {st.get('kind')}"
+        )
     console.print(f"source: {p.get('url')} (published {p.get('statement_date')})")
     cands = p.get("candidates")
     if isinstance(cands, dict):
@@ -83,6 +95,7 @@ def render(console: Console, item: dict[str, Any], src: dict[str, Any]) -> None:
         fields = [f for f in item["field"].split(",") if f and f != "exists"] or [
             "result_category",
             "result_subtype",
+            "stop_data_trigger",
             "sponsor_explanation_category",
             "window_start",
             "window_end",
@@ -99,6 +112,21 @@ def render(console: Console, item: dict[str, Any], src: dict[str, Any]) -> None:
                 )
     if p.get("tiebreak"):
         console.print(f"tie-break: {json.dumps(p['tiebreak'])[:600]}")
+    if item["reason"] == "exclusion_link":
+        console.print(f"why stopped: {p.get('why_stopped')}")
+        console.print(f"interventions: {', '.join(p.get('interventions') or [])}")
+        t = Table(title="which trial does it cite?")
+        for col in ("#", "nct_id", "title", "status", "same drug"):
+            t.add_column(col)
+        for i, c in enumerate(item.get("candidates") or [], 1):
+            t.add_row(
+                str(i),
+                c["nct_id"],
+                c["title"] or "",
+                c["status"] or "",
+                "yes" if c["shared_intervention"] else "",
+            )
+        console.print(t)
     if item["reason"] == "event_link_ambiguous":
         t = Table(title="candidate events")
         for col in ("#", "event_id", "asset", "indication", "trial", "status"):
@@ -124,9 +152,20 @@ def decide(
     event_id: str | None = None,
     note: str | None = None,
 ) -> str | None:
-    """Apply an operator decision. choice: A | B | value | link | new | reject | skip."""
+    """Apply an operator decision. choice: A | B | value | link | new | reject | skip, and for
+    `exclusion_link` items: link_trial (value = the cited NCT id) or reject (cites no trial)."""
     p = item["payload"]
     with engine.begin() as conn:
+        if item["reason"] == "exclusion_link" and choice in ("link_trial", "reject"):
+            exclusions.set_link(
+                conn, p["nct_id"], value if choice == "link_trial" else None, f"human:{reviewer}"
+            )
+            conn.execute(
+                update(review_queue)
+                .where(review_queue.c.item_id == item["item_id"])
+                .values(status="closed", closed_at=now(), closed_by=f"human:{reviewer}")
+            )
+            return None
         if choice == "skip":
             conn.execute(
                 update(review_queue)
@@ -214,9 +253,18 @@ def interactive(
                 .mappings()
                 .one()
             )
+        if item["reason"] == "exclusion_link":
+            with engine.connect() as conn:
+                item["candidates"] = exclusions.link_candidates(
+                    conn, item["payload"]["sponsor_id"], item["payload"]["nct_id"]
+                )
         render(console, item, src)
         while True:
-            if item["reason"] == "event_link_ambiguous":
+            if item["reason"] == "exclusion_link":
+                ans = (
+                    ask("[#] cited trial · [r] cites no trial · [s]kip · [q]uit > ").strip().lower()
+                )
+            elif item["reason"] == "event_link_ambiguous":
                 ans = (
                     ask("[#] link to candidate · [n]ew event · [r]eject · [s]kip · [q]uit > ")
                     .strip()
@@ -258,6 +306,10 @@ def interactive(
                     stats["decided"] += 1
                 elif ans == "r":
                     decide(engine, item, "reject", reviewer)
+                    stats["decided"] += 1
+                elif ans.isdigit() and item["reason"] == "exclusion_link":
+                    cand = item["candidates"][int(ans) - 1]
+                    decide(engine, item, "link_trial", reviewer, value=cand["nct_id"])
                     stats["decided"] += 1
                 elif ans == "n":
                     decide(engine, item, "new", reviewer)

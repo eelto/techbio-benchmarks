@@ -92,12 +92,33 @@ def review(
 
 
 @app.command()
-def report(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
-    """Summary: universe, sources, events, 90-day scope, queue size, slips, spend."""
+def report(
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    drops: Annotated[int, typer.Option(help="quote drops to sample for the spot-check")] = 10,
+) -> None:
+    """Summary: universe, sources, events, 90-day scope, queue size, slips, quote drops, spend.
+
+    The JSON form is shareable. The plain form also prints a random sample of quote drops, which
+    shows source text: it is for the operator's terminal only, never for a PR or an export."""
+    from techbio.ledger.quotes import drop_sample
     from techbio.ledger.report import summary
 
-    s = summary(get_engine())
-    console.print_json(json.dumps(s, default=str)) if as_json else console.print(s)
+    engine = get_engine()
+    s = summary(engine)
+    if as_json:
+        console.print_json(json.dumps(s, default=str))
+        return
+    console.print(s)
+    sample = drop_sample(engine, n=drops)
+    console.rule(f"quote drops: random sample of {len(sample)} (local only: contains source text)")
+    for d in sample:
+        st = d["statement"] or {}
+        console.print(
+            f"[bold]{d['reject_reason']}[/] score {d['score']:.2f} · {d['model_key']} · "
+            f"{st.get('event_type')} {st.get('asset_name')} {st.get('kind')} · {d['url']}"
+        )
+        console.print(f"  claimed: {d['claimed_quote']}")
+        console.print(f"  nearest: {d['nearest_span']}")
 
 
 @app.command()
@@ -105,7 +126,10 @@ def sample(
     out: Annotated[Path, typer.Option()] = Path("docs/milestones/ledger-v0/sample_events.csv"),
     n: int = 25,
 ) -> None:
-    """Write sample rows (structured facts and links only) for the milestone write-up."""
-    from techbio.ledger.report import write_sample
+    """Write sample rows and the exclusion list (structured facts and links only)."""
+    from techbio.ledger.report import write_exclusions, write_sample
 
-    console.print(f"wrote {write_sample(get_engine(), out, n)} rows to {out}")
+    engine = get_engine()
+    console.print(f"wrote {write_sample(engine, out, n)} rows to {out}")
+    ex = out.with_name("exclusions.csv")
+    console.print(f"wrote {write_exclusions(engine, ex)} exclusions to {ex}")

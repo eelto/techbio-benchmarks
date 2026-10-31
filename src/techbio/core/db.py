@@ -69,7 +69,7 @@ metadata = MetaData(
 
 EVENT_TYPES = ("readout", "fda_decision", "adcom", "discontinuation")
 DATE_TYPES = ("dated", "fuzzy")
-EVENT_STATUS = ("open", "resolved", "void")
+EVENT_STATUS = ("open", "resolved", "void", "excluded")
 REVIEWER_KINDS = ("human", "model-adjudicated", "auto-agreement", "deterministic")
 
 
@@ -162,6 +162,7 @@ trials = Table(
     Column("allocation", String),
     Column("masking", String),
     Column("enrollment", Integer),
+    Column("enrollment_type", String),  # ACTUAL | ESTIMATED
     Column("overall_status", String),
     Column("why_stopped", Text),
     Column("primary_completion_date", String),  # CT.gov partial dates ("2027-03") kept as given
@@ -291,6 +292,7 @@ review_queue = Table(
                 "operator_flag",
                 "outcome_confirmation",
                 "parse_failed",
+                "exclusion_link",
             ),
         ),
         name="reason",
@@ -307,7 +309,12 @@ resolutions = Table(
     Column("event_date", Date, nullable=False),
     Column("result_category", String),  # NULL only for voids with no result (e.g. cancelled)
     Column("result_subtype", String),
+    # The ledger's category (taxonomy.explanation_category); the sponsor's stated one is kept too.
     Column("sponsor_explanation_category", String),
+    Column("stated_explanation_category", String),
+    Column("stop_data_trigger", String),  # interim_analysis | futility | dsmb_recommendation
+    Column("enrolled_at_stop", Integer),  # CT.gov actual enrollment, for stopped readouts
+    Column("scored_as", String),  # the result the binary scores; "missed" for data-triggered stops
     Column("outcome_binary", Integer),  # 1 | 0 | NULL when void
     Column("void_reason", String),
     Column("taxonomy_version", String, nullable=False),
@@ -319,6 +326,54 @@ resolutions = Table(
         "result_category IS NOT NULL OR void_reason IS NOT NULL", name="result_or_void"
     ),
 )
+
+exclusions = Table(
+    "exclusions",
+    metadata,
+    # Registry records that are not events (taxonomy v1.1): withdrawn before enrollment, or withdrawn
+    # citing another trial's data (linked to that trial). Exported with reasons and links only.
+    Column("exclusion_id", String, primary_key=True),
+    Column("nct_id", String, nullable=False, unique=True),
+    Column("sponsor_id", String, ForeignKey("sponsors.sponsor_id")),
+    Column("source_id", String, ForeignKey("sources.source_id"), nullable=False),
+    Column("reason", String, nullable=False),
+    Column("enrolled", Integer),
+    Column("linked_nct_id", String),
+    Column("linked_by", String),  # parser:<version> | human:<id>
+    Column("linked_recorded_at", TS),
+    Column("taxonomy_version", String, nullable=False),
+    Column("recorded_at", TS, nullable=False),
+    CheckConstraint(
+        _in("reason", ("withdrawn_before_enrollment", "withdrawn_citing_other_trial")),
+        name="reason",
+    ),
+)
+
+quote_checks = Table(
+    "quote_checks",
+    metadata,
+    # One row per quote checked (accepted or not). Local only: claimed quotes and spans are source
+    # text and never leave the machine.
+    Column("check_id", String, primary_key=True),
+    Column("run_id", String, nullable=False),
+    Column("source_id", String, ForeignKey("sources.source_id"), nullable=False),
+    Column("model_key", String, nullable=False),
+    Column("role", String, nullable=False),  # extractor | tiebreak
+    Column("statement_idx", Integer),
+    Column("field", String),
+    Column("statement", JSON),
+    Column("claimed_quote", Text),
+    Column("matched_span", Text),
+    Column("score", Float, nullable=False),
+    Column("method", String, nullable=False),  # exact | fuzzy | rejected
+    Column("accepted", Boolean, nullable=False),
+    Column("reject_reason", String),
+    Column("threshold", Float, nullable=False),
+    Column("matcher_version", String, nullable=False),
+    Column("created_recorded_at", TS, nullable=False),
+    CheckConstraint(_in("method", ("exact", "fuzzy", "rejected")), name="method"),
+)
+Index("ix_quote_checks_source", quote_checks.c.source_id)
 
 # --------------------------------------------------------------------------- shared
 

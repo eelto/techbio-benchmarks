@@ -36,9 +36,25 @@ _SUFFIXES = {
 }
 _STATE_TAIL = re.compile(r"\s*/\s*[a-z]{2,3}/?\s*$", re.I)
 _GENERIC = {
-    "therapeutics", "pharmaceuticals", "pharmaceutical", "pharma", "biosciences", "bioscience",
-    "biotherapeutics", "biopharma", "biopharmaceuticals", "biotech", "biotechnology", "bio",
-    "medicines", "oncology", "sciences", "life", "labs", "laboratories", "and",
+    "therapeutics",
+    "pharmaceuticals",
+    "pharmaceutical",
+    "pharma",
+    "biosciences",
+    "bioscience",
+    "biotherapeutics",
+    "biopharma",
+    "biopharmaceuticals",
+    "biotech",
+    "biotechnology",
+    "bio",
+    "medicines",
+    "oncology",
+    "sciences",
+    "life",
+    "labs",
+    "laboratories",
+    "and",
 }  # "VERTEX PHARMACEUTICALS INC /MA"
 
 

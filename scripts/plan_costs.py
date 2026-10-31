@@ -6,21 +6,33 @@ from config/models.yaml, and the harness pilot replaces these numbers with measu
     uv run python scripts/plan_costs.py
 """
 
-from math import ceil, sqrt
+from math import sqrt
 from statistics import NormalDist
 
 # $ per 1M tokens (input, output), and the batch multiplier on each path (1.0 = synchronous).
 MODELS = {
     #                    in     out   harness  arena
-    "gpt-6-astra":      (10.0, 50.0, 0.5, 0.5),
+    "gpt-6-astra": (10.0, 50.0, 0.5, 0.5),
     "claude-fable-5-1": (10.0, 50.0, 0.5, 0.5),
-    "gemini-4-argon":   (4.0, 20.0, 1.0, 0.5),  # Dec-1 price. Inspect's Gemini batch can't do thinking.
-    "grok-4.7":         (2.0, 6.0, 0.8, 0.8),
-    "muse-wonder-1.0":  (4.0, 20.0, 1.0, 1.0),  # Meta has no batch API.
-    "glm-5.3":          (1.40, 4.40, 0.5, 0.5),  # via Together
-    "claude-opus-5-5":  (4.0, 20.0, 0.5, 0.5),  # mid-tier, enters later (cost-per-point chart)
+    "gemini-4-argon": (
+        4.0,
+        20.0,
+        1.0,
+        0.5,
+    ),  # Dec-1 price. Inspect's Gemini batch can't do thinking.
+    "grok-4.7": (2.0, 6.0, 0.8, 0.8),
+    "muse-wonder-1.0": (4.0, 20.0, 1.0, 1.0),  # Meta has no batch API.
+    "glm-5.3": (1.40, 4.40, 0.5, 0.5),  # via Together
+    "claude-opus-5-5": (4.0, 20.0, 0.5, 0.5),  # mid-tier, enters later (cost-per-point chart)
 }
-FLAGSHIPS = ["gpt-6-astra", "claude-fable-5-1", "gemini-4-argon", "grok-4.7", "muse-wonder-1.0", "glm-5.3"]
+FLAGSHIPS = [
+    "gpt-6-astra",
+    "claude-fable-5-1",
+    "gemini-4-argon",
+    "grok-4.7",
+    "muse-wonder-1.0",
+    "glm-5.3",
+]
 # Second seed and the uncapped delta run are priced on the most expensive models (conservative).
 TOP3_ASSUMED = ["gpt-6-astra", "claude-fable-5-1", "gemini-4-argon"]
 TOP1_ASSUMED = "claude-fable-5-1"
@@ -63,7 +75,7 @@ def items_cost(model, n, tin, tout_per_item):
 # ---- sequential stopping (spec: docs/design.md §5) --------------------------------------------
 def checkpoints(n_total, first=150, step=50):
     cps = list(range(first, n_total, step))
-    return cps + [n_total]
+    return [*cps, n_total]
 
 
 def stop_n(n_total, p, half_width=0.05):
@@ -133,9 +145,7 @@ def gpqa_diamond(scen):
 
 
 def model_day_items():
-    return {
-        name: (ANCHOR_N if n > 150 else n, tin) for name, (n, tin, _) in LAUNCH.items()
-    }
+    return {name: (ANCHOR_N if n > 150 else n, tin) for name, (n, tin, _) in LAUNCH.items()}
 
 
 def model_day(model, scen):
@@ -145,10 +155,15 @@ def model_day(model, scen):
 # ---- arena ------------------------------------------------------------------------------------
 def arena_round(events, models=FLAGSHIPS, samples=ARENA_SAMPLES):
     tin = ARENA_IN_SHARED + ARENA_IN_PACK
-    return sum(
-        call_cost(m, events * tin, events * ARENA_OUT, "arena", cached_in=events * ARENA_IN_SHARED)
-        for m in models
-    ) * samples
+    return (
+        sum(
+            call_cost(
+                m, events * tin, events * ARENA_OUT, "arena", cached_in=events * ARENA_IN_SHARED
+            )
+            for m in models
+        )
+        * samples
+    )
 
 
 def arena_per_model_round(model, events, samples=ARENA_SAMPLES):
@@ -165,7 +180,11 @@ def extract(docs, tin=3000, tout=1200, tiebreak_frac=0.2):
 # ---- year one ---------------------------------------------------------------------------------
 YEAR = {  # low, mid, high
     "events_per_round": (20, 30, 50),
-    "roster_growth": (1.15, 1.25, 1.5),  # average model-versions vs launch six (superseded kept, Q-C6)
+    "roster_growth": (
+        1.15,
+        1.25,
+        1.5,
+    ),  # average model-versions vs launch six (superseded kept, Q-C6)
     "model_days": (6, 10, 14),  # flagship releases + mid-tier entries per year
     "anchor_reruns": (150, 300, 600),  # preprint models in both setups (D15)
     "ledger": (150, 220, 400),
@@ -207,21 +226,29 @@ def main():
             f" | GPQA Diamond ${gpqa_diamond(s):4.0f}"
         )
     _, per = launch("mid", incremental=False)
-    print("  per model, launch run, mid (full, not net of pilot): "
-          + ", ".join(f"{k} ${v:.0f}" for k, v in per.items()))
+    print(
+        "  per model, launch run, mid (full, not net of pilot): "
+        + ", ".join(f"{k} ${v:.0f}" for k, v in per.items())
+    )
 
     print("\nModel-day (anchor subsets, capped reasoning)")
-    for m in FLAGSHIPS + ["claude-opus-5-5"]:
+    for m in [*FLAGSHIPS, "claude-opus-5-5"]:
         lo, mid, hi = (model_day(m, s) for s in CAPPED)
-        print(f"  {m:17}: ${lo:5.1f} / ${mid:5.1f} / ${hi:5.1f}   arena +${arena_per_model_round(m, 30):4.1f}/round (30 ev)")
+        print(
+            f"  {m:17}: ${lo:5.1f} / ${mid:5.1f} / ${hi:5.1f}   arena +${arena_per_model_round(m, 30):4.1f}/round (30 ev)"
+        )
 
     print("\nArena round (2 samples x 6 flagships)")
     for ev in (25, 30, 50):
         print(f"  {ev} events: ${arena_round(ev):5.1f}")
 
     print("\nLedger extraction")
-    for label, docs in (("bootstrap v0 (~6k docs)", 6000), ("backfill (~12k docs)", 12000),
-                        ("daily (~40 docs)", 40), ("month (~900 docs)", 900)):
+    for label, docs in (
+        ("bootstrap v0 (~6k docs)", 6000),
+        ("backfill (~12k docs)", 12000),
+        ("daily (~40 docs)", 40),
+        ("month (~900 docs)", 900),
+    ):
         print(f"  {label:26}: ${extract(docs):7.2f}")
 
     print("\nYear one")

@@ -1,6 +1,8 @@
 """Ledger summary (printed after every refresh) and the sample export for milestone write-ups.
 
-Exports carry structured facts and links only: never press-release text, quotes or passages.
+Exports carry structured facts and links only: never press-release text, quotes or passages. The
+quote-drop sample (ledger.quotes.drop_sample) is printed to the operator's terminal and never
+exported, because it shows source text.
 """
 
 from __future__ import annotations
@@ -10,11 +12,21 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, case, func, select
 
-from techbio.core.db import events, promises, resolutions, sources, spend_ledger, sponsors
+from techbio.core.db import (
+    events,
+    exclusions,
+    promises,
+    quote_checks,
+    resolutions,
+    sources,
+    spend_ledger,
+    sponsors,
+)
 from techbio.ledger.review import queue_size
 from techbio.ledger.slip import event_slips, slip_summary
+from techbio.ledger.taxonomy import STRATEGIC_STOP
 
 
 def _latest_promises(conn) -> dict[str, Any]:
@@ -79,6 +91,10 @@ def scope_events(
                             "result_category",
                             "result_subtype",
                             "sponsor_explanation_category",
+                            "stated_explanation_category",
+                            "stop_data_trigger",
+                            "enrolled_at_stop",
+                            "scored_as",
                             "outcome_binary",
                             "void_reason",
                             "taxonomy_version",
@@ -91,6 +107,75 @@ def scope_events(
     upcoming.sort(key=lambda x: (x["guided_end"], x["guided_start"]))
     resolved.sort(key=lambda x: x["event_date"], reverse=True)
     return {"upcoming": upcoming, "resolved": resolved}
+
+
+def quote_check_summary(conn, days: int = 7, max_docs: int = 20) -> dict[str, Any]:
+    """Extractor quote checks in the last `days` days: totals, reasons, and the drop rate of every
+    document with at least one drop (worst first)."""
+    since = datetime.now(UTC) - timedelta(days=days)
+    win = (quote_checks.c.role == "extractor") & (quote_checks.c.created_recorded_at >= since)
+    dropped = func.sum(case((quote_checks.c.accepted.is_(False), 1), else_=0))
+    checked, n_drop, fuzzy = conn.execute(
+        select(
+            func.count(),
+            func.coalesce(dropped, 0),
+            func.coalesce(func.sum(case((quote_checks.c.method == "fuzzy", 1), else_=0)), 0),
+        ).where(win)
+    ).one()
+    reasons = dict(
+        conn.execute(
+            select(quote_checks.c.reject_reason, func.count())
+            .where(win, quote_checks.c.accepted.is_(False))
+            .group_by(quote_checks.c.reject_reason)
+        ).all()
+    )
+    per_doc = [
+        {
+            "source_id": r.source_id,
+            "url": r.url,
+            "checked": r.checked,
+            "dropped": r.dropped,
+            "drop_rate": round(r.dropped / r.checked, 3),
+        }
+        for r in conn.execute(
+            select(
+                quote_checks.c.source_id,
+                sources.c.url,
+                func.count().label("checked"),
+                dropped.label("dropped"),
+            )
+            .join(sources, sources.c.source_id == quote_checks.c.source_id)
+            .where(win)
+            .group_by(quote_checks.c.source_id, sources.c.url)
+        ).all()
+        if r.dropped
+    ]
+    per_doc.sort(key=lambda d: (-d["drop_rate"], -d["dropped"], d["source_id"]))
+    return {
+        "window_days": days,
+        "checked": checked,
+        "dropped": n_drop,
+        "fuzzy_kept": fuzzy,
+        "drop_rate": round(n_drop / checked, 3) if checked else None,
+        "drops_by_reason": reasons,
+        "documents_with_drops": len(per_doc),
+        "per_document": per_doc[:max_docs],
+    }
+
+
+def strategic_stop_summary(conn) -> dict[str, Any]:
+    rows = conn.execute(
+        select(resolutions.c.outcome_binary, resolutions.c.enrolled_at_stop).where(
+            resolutions.c.sponsor_explanation_category == STRATEGIC_STOP
+        )
+    ).all()
+    return {
+        "n": len(rows),
+        "void": sum(1 for r in rows if r.outcome_binary is None),
+        "scored_missed": sum(1 for r in rows if r.outcome_binary == 0),
+        "patients_enrolled": sum(r.enrolled_at_stop or 0 for r in rows),
+        "unknown_n": sum(1 for r in rows if r.enrolled_at_stop is None),
+    }
 
 
 def summary(engine: Engine) -> dict[str, Any]:
@@ -130,6 +215,13 @@ def summary(engine: Engine) -> dict[str, Any]:
             )
         ).scalar_one()
         slips = slip_summary(conn)
+        quotes = quote_check_summary(conn)
+        strategic = strategic_stop_summary(conn)
+        excl = dict(
+            conn.execute(
+                select(exclusions.c.reason, func.count()).group_by(exclusions.c.reason)
+            ).all()
+        )
     scope = scope_events(engine)
     return {
         "sponsors_in_universe": n_spon,
@@ -142,9 +234,12 @@ def summary(engine: Engine) -> dict[str, Any]:
         },
         "resolved_last_90d": len(scope["resolved"]),
         "voids": dict(voids),
+        "strategic_stops_after_enrollment": strategic,
+        "exclusions": excl,
         "resolutions_awaiting_operator_confirmation": unconfirmed,
         "queue": queue_size(engine),
         "slips": slips,
+        "quote_checks": quotes,
         "spend_this_month_usd": round(float(spend_month), 2),
     }
 
@@ -170,9 +265,26 @@ SAMPLE_COLUMNS = (
     "result_category",
     "result_subtype",
     "sponsor_explanation_category",
+    "stated_explanation_category",
+    "stop_data_trigger",
+    "enrolled_at_stop",
+    "scored_as",
     "outcome_binary",
     "void_reason",
     "source_url",
+)
+
+EXCLUSION_COLUMNS = (
+    "nct_id",
+    "sponsor",
+    "reason",
+    "enrolled",
+    "linked_nct_id",
+    "linked_event_id",
+    "linked_by",
+    "taxonomy_version",
+    "registry_url",
+    "linked_registry_url",
 )
 
 
@@ -194,6 +306,42 @@ def write_sample(engine: Engine, path: Path, n: int = 25) -> int:
                     "tickers": " ".join(r["tickers"]),
                     "restatements": s.get("restatements"),
                     "slips": s.get("slips"),
+                }
+            )
+    return len(rows)
+
+
+def write_exclusions(engine: Engine, path: Path) -> int:
+    """Every exclusion with its reason and link (S7: codes and links, never the registry's text)."""
+    with engine.connect() as conn:
+        ev_by_nct = dict(
+            conn.execute(
+                select(events.c.nct_id, events.c.event_id).where(events.c.nct_id.is_not(None))
+            ).all()
+        )
+        rows = (
+            conn.execute(
+                select(exclusions, sponsors.c.name.label("sponsor"))
+                .join(sponsors, sponsors.c.sponsor_id == exclusions.c.sponsor_id, isouter=True)
+                .order_by(exclusions.c.recorded_at)
+            )
+            .mappings()
+            .all()
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=EXCLUSION_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            linked = r["linked_nct_id"]
+            w.writerow(
+                {
+                    **r,
+                    "linked_event_id": ev_by_nct.get(linked) if linked else None,
+                    "registry_url": f"https://clinicaltrials.gov/study/{r['nct_id']}",
+                    "linked_registry_url": f"https://clinicaltrials.gov/study/{linked}"
+                    if linked
+                    else None,
                 }
             )
     return len(rows)

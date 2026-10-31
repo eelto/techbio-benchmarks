@@ -13,10 +13,19 @@ from typing import Any
 
 from sqlalchemy import Connection, func, select, update
 
-from techbio.core.db import events, label_sources, labels, now, promises, resolutions, sources
+from techbio.core.db import (
+    events,
+    label_sources,
+    labels,
+    now,
+    promises,
+    resolutions,
+    sources,
+    trials,
+)
 from techbio.core.ids import new_id
 from techbio.ledger.names import asset_key, assets_overlap
-from techbio.ledger.taxonomy import TAXONOMY_VERSION, score_outcome
+from techbio.ledger.taxonomy import TAXONOMY_VERSION, explanation_category, score_outcome
 
 
 @dataclass
@@ -39,6 +48,7 @@ class Statement:
     result_category: str | None = None
     result_subtype: str | None = None
     sponsor_explanation_category: str | None = None
+    stop_data_trigger: str | None = None
     quote: str | None = None
     adcom_vote_held: bool = True
 
@@ -324,13 +334,28 @@ def resolve_event(
         raise ValueError("resolutions need a primary source (S9)")
     subtype = cur.get("result_subtype", (None, None))[0]
     expl = cur.get("sponsor_explanation_category", (None, None))[0]
+    trigger = cur.get("stop_data_trigger", (None, None))[0]
     vote_held = cur.get("adcom_vote_held", (True, None))[0]
     if cancelled:
         outcome = score_outcome(ev["event_type"], "", cancelled=True)
     else:
         outcome = score_outcome(
-            ev["event_type"], result[0], subtype, expl, adcom_vote_held=bool(vote_held)
+            ev["event_type"],
+            result[0],
+            subtype,
+            expl,
+            adcom_vote_held=bool(vote_held),
+            data_trigger=trigger,
         )
+    enrolled = None
+    if result[0] == "stopped" and ev["nct_id"]:
+        t = conn.execute(
+            select(trials.c.enrollment, trials.c.enrollment_type).where(
+                trials.c.nct_id == ev["nct_id"]
+            )
+        ).first()
+        if t and t.enrollment_type == "ACTUAL":
+            enrolled = t.enrollment
     ed = cur.get("event_date", (None, None))[0]
     event_date = date.fromisoformat(ed) if ed else prov.statement_date
     label_id = result[1] or cur.get("cancelled", (None, None))[1]
@@ -340,7 +365,13 @@ def resolve_event(
         event_date=event_date,
         result_category=result[0],
         result_subtype=subtype,
-        sponsor_explanation_category=expl,
+        sponsor_explanation_category=explanation_category(
+            ev["event_type"], result[0], subtype, expl
+        ),
+        stated_explanation_category=expl,
+        stop_data_trigger=trigger if result[0] == "stopped" else None,
+        enrolled_at_stop=enrolled,
+        scored_as=outcome.scored_as,
         outcome_binary=outcome.binary,
         void_reason=outcome.void_reason,
         taxonomy_version=TAXONOMY_VERSION,
@@ -411,6 +442,7 @@ def apply_statement(
                 ("result_category", result),
                 ("result_subtype", st.result_subtype),
                 ("sponsor_explanation_category", st.sponsor_explanation_category),
+                ("stop_data_trigger", st.stop_data_trigger),
                 ("event_date", (st.event_date or prov.statement_date).isoformat()),
                 ("adcom_vote_held", st.adcom_vote_held if st.event_type == "adcom" else None),
             ):
