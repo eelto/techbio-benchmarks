@@ -1,9 +1,11 @@
 # Outcome taxonomy
 
-Version: **v1** (operator-confirmed 2026-10-30, `docs/decisions.md` B.4). The scope and taxonomy
-defaults (Q-A1–A7, Q-B1–B7) were accepted, with the operator's narrower void rule in §4. Items marked
-**[flag]** are my reading of that rule where the wording leaves a case open. They are listed in §7
-for confirmation, and the code implements them as written here.
+Version: **v1.1** (operator-confirmed 2026-10-30). v1 (`docs/decisions.md` B.4) accepted the scope
+and taxonomy defaults (Q-A1–A7, Q-B1–B7) with the operator's narrower void rule in §4. v1.1 (same
+day, decisions T.1–T.5, after the first real CT.gov records) adds the business-stop rule, the
+exclusions in §1, and the derived explanation category in §5. Nothing was scored under v1. Items
+marked **[flag]** are my reading where the wording leaves a case open. They are listed in §7 for
+confirmation, and the code implements them as written here.
 
 After v1, this file grows only from adjudications, and each rule gets a date and an example
 `event_id`. Every resolution stores the taxonomy version it was scored under. A change in mapping
@@ -24,6 +26,23 @@ private issuers are included through 6-K. Ex-US trials of US-listed sponsors are
 
 PDUFA goal-date extensions (for example, 3 months for a major amendment) do **not** resolve an event.
 They update the expected date and are recorded as slip.
+
+### Not events: exclusions (v1.1, operator 2026-10-30)
+
+A registry record that never had a chance to read out is not an event. It is recorded in
+`exclusions` with its reason and exported in `exclusions.csv`. Any open event that turns out to
+belong to that trial is closed with status `excluded` (a `deterministic` label records why).
+
+| Case | Rule | Example |
+|---|---|---|
+| Withdrawn before enrollment (CT.gov `WITHDRAWN`, or `TERMINATED`/`SUSPENDED` with an actual enrollment of 0) | not an event; `withdrawn_before_enrollment` | NCT05951205 (Vertex, Phase 3 exa-cel, withdrawn, 0 enrolled: "Modification to the clinical development plan") |
+| Withdrawn citing another trial's data | not an event; `withdrawn_citing_other_trial`, linked to the cited trial (and through it to that trial's event) | NCT06598631 (Lilly, Phase 2 volenrelaxin in CKD, withdrawn, 0 enrolled, citing "a related heart failure study that demonstrated no benefit"; the cited trial is NCT05592275, LY3540378 in HFpEF, terminated after an interim) |
+
+A record that names the cited trial's NCT number is linked by the parser. One that describes it only
+in words goes to the review queue (`exclusion_link`), and the operator picks the trial; "cites no
+trial" reclassifies it as withdrawn before enrollment. A withdrawn record shows 0 enrolled, so its
+planned size is unknown: a withdrawn randomized Phase 2 is treated as in scope for this check (it can
+only become an exclusion, never an event).
 
 ## 2. Result categories (fixed) and definitions
 
@@ -72,8 +91,9 @@ linked for scoring.
 | stopped / efficacy | 1 |
 | stopped / futility | 0 |
 | stopped / safety | 0 |
-| stopped / business (financing, strategic, acquisition) | **void** |
-| stopped / operational (enrollment, supply, sites) | **void** [flag] |
+| stopped / business (financing, strategic, acquisition), no data trigger documented | **void** (v1.1) |
+| stopped / business, with a documented data trigger (interim analysis, futility analysis, DSMB recommendation) | 0, scored as `missed` (v1.1) |
+| stopped / operational (enrollment, supply, sites) | **void** (operator-confirmed 2026-10-30) |
 | approved | 1 |
 | CRL | 0 |
 | withdrawn | 0, unless the sponsor's stated reason is `financial` or `strategic_portfolio`, then **void** [flag] |
@@ -91,8 +111,9 @@ How the code applies it:
 | Case | Result |
 |---|---|
 | Event cancelled: AdCom cancelled, or a decision event whose application never reaches action for a reason unrelated to its data | **void** |
-| Trial stopped for a business reason (financing, strategic, acquisition) | **void** |
-| Trial stopped for an operational reason (enrollment, supply, sites) | **void** [flag] |
+| Trial stopped for a business reason (financing, strategic, acquisition) after enrollment, with no data trigger documented | **void** for endpoint scoring (v1.1). Example: NCT04396236 (Lilly, Phase 3 lasmiditan in pediatric migraine, 847 enrolled, "strategic business decision"). |
+| The same, but the primary source documents a data trigger (interim analysis, futility analysis, DSMB recommendation) | **scored 0 as `missed`** (v1.1). The trigger is the reserved field `stop_data_trigger`. |
+| Trial stopped for an operational reason (enrollment, supply, sites) | **void** (confirmed 2026-10-30). Example: NCT05074420 (Lilly, Phase 3 baricitinib in pediatric COVID-19, 6 enrolled, "inability to enroll participants"). |
 | Application withdrawn for a financial or strategic reason | **void** [flag] |
 | AdCom held but no vote taken (discussion-only meeting) | **void** [flag] |
 | Trial stopped and the sponsor gives no reason (`not_disclosed`) | **never void.** Scored by its subtype. If no subtype can be assigned from a primary source, it goes to the human queue and the operator assigns one. [flag] |
@@ -114,6 +135,16 @@ This is a reserved field, so it is human-adjudicated on disagreement. It applies
 `efficacy` · `safety` · `regulatory_feedback` · `manufacturing_cmc` · `strategic_portfolio` ·
 `financial` · `partner_decision` · `enrollment_operational` · `not_disclosed`
 
+**Derived category (v1.1): `strategic_stop_after_enrollment`.** Every trial stopped for a business
+reason gets this category in its resolution, whether it is void or scored as missed, together with
+the enrolled-patient count (CT.gov actual enrollment, `enrolled_at_stop`). All such stops are after
+enrollment, because trials withdrawn before enrollment are not events (§1). The extractors never
+assign it: they record the sponsor's stated reason (kept as `stated_explanation_category`), and the
+ledger derives the category. The refresh summary reports the count, how many were void and how many
+were scored, the total patients enrolled, and how many have no linked registry count. The operator's
+rationale: a "strategic" stop after hundreds of patients is often a data decision described as a
+business one, and the pattern is a finding in itself.
+
 For CRLs, the category records the sponsor's stated reason. If FDA has published the letter, the
 CRL's own deficiencies are a separate label. The two often disagree, and that disagreement is
 informative.
@@ -128,13 +159,9 @@ keystroke when both extractors agree. No model alone decides a score that ranks 
 These are my readings of the void rule. The code implements them as written above until you say
 otherwise.
 
-1. **Operational stops → void.** "Unrelated to its outcome" seems to cover slow enrollment, drug
-   supply, and site closures. But slow enrollment is sometimes a soft signal about the drug.
-   Alternative: score them 0.
-2. **A business stop that discloses topline data.** Under the rule as written it is void. But "anything
-   resolved by data is scored" suggests scoring it on the data (met or missed) when the primary
-   endpoint was reported. My recommendation: score on the data when primary-endpoint results are
-   disclosed, and void only when there are none.
+1. ~~Operational stops → void.~~ **Confirmed by the operator, 2026-10-30.**
+2. ~~A business stop that discloses topline data.~~ **Decided 2026-10-30 (v1.1):** void unless a data
+   trigger is documented, then scored as missed; always logged as `strategic_stop_after_enrollment`.
 3. **Withdrawals.** Withdrawn for a financial or strategic reason → void. Otherwise 0, because
    withdrawal before action usually signals an expected CRL.
 4. **`split` can no longer be void.** With one deciding question (B5), a split is a tie on it, which
@@ -144,7 +171,25 @@ otherwise.
 6. **A stop with no stated reason is never void.** The rule needs a stated non-outcome reason to
    void. If the subtype can't be assigned, you assign it in review. My recommendation is to treat
    unexplained stops as 0.
+7. **New (v1.1): a trial stopped after enrollment citing another trial's results.** For example,
+   "terminated following the negative results of the sister study". It is an event (it enrolled), but
+   its own data didn't decide the stop. My reading: void, and link it to the cited trial, as for the
+   withdrawn case. Until you decide, the extractors and review assign it a subtype as usual.
+8. **New (v1.1): a business stop after a *positive* interim.** T.1 scores a documented data trigger
+   as missed. If the sponsor reports the interim as a success (for example, an acquirer stops a trial
+   that was working), my reading is that the stop subtype is `efficacy` (scored 1), not business, so
+   the missed rule doesn't apply. The extraction prompt says to use the reason the document gives.
+9. **New (v1.1): suspended trials.** CT.gov `SUSPENDED` (often a clinical hold) is currently treated
+   like a stop, so a hold could resolve a readout as stopped/safety (0) even though the trial may
+   resume. My recommendation: a suspension does not resolve the event; it is recorded and the event
+   stays open until the trial is terminated or the readout happens.
 
 ## 8. Adjudication log
 
-_Empty. Entries look like: `2026-11-20 · evt_01J… · mixed vs missed · rule: … · reviewer`._
+Entries look like: `2026-11-20 · evt_01J… · mixed vs missed · rule: … · reviewer`. Rules decided
+before the first events existed cite the registry record; the event ID is added when it is created.
+
+- `2026-10-30 · NCT04396236 (event ID on ingestion) · business stop after enrollment · rule T.1: void unless a data trigger is documented, then missed; category strategic_stop_after_enrollment with enrolled count (847) · operator`
+- `2026-10-30 · NCT05951205 · withdrawn, 0 enrolled · rule T.2: not an event, exclusion withdrawn_before_enrollment · operator`
+- `2026-10-30 · NCT06598631 · withdrawn citing another trial (NCT05592275) · rule T.3: not an event, exclusion linked to the cited trial · operator`
+- `2026-10-30 · NCT05074420 · stopped for failure to enroll (6 enrolled) · rule T.4: void, operational (confirmed) · operator`

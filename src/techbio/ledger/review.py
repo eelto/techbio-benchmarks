@@ -10,6 +10,7 @@ items (a withdrawn trial citing another trial without its NCT number) ask which 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import date
 from typing import Any
@@ -262,7 +263,11 @@ def interactive(
         while True:
             if item["reason"] == "exclusion_link":
                 ans = (
-                    ask("[#] cited trial · [r] cites no trial · [s]kip · [q]uit > ").strip().lower()
+                    ask(
+                        "[#] or NCT number of the cited trial · [r] cites no trial · [s]kip · [q]uit > "
+                    )
+                    .strip()
+                    .lower()
                 )
             elif item["reason"] == "event_link_ambiguous":
                 ans = (
@@ -310,6 +315,9 @@ def interactive(
                 elif ans.isdigit() and item["reason"] == "exclusion_link":
                     cand = item["candidates"][int(ans) - 1]
                     decide(engine, item, "link_trial", reviewer, value=cand["nct_id"])
+                    stats["decided"] += 1
+                elif re.fullmatch(r"nct\d{8}", ans) and item["reason"] == "exclusion_link":
+                    decide(engine, item, "link_trial", reviewer, value=ans.upper())
                     stats["decided"] += 1
                 elif ans == "n":
                     decide(engine, item, "new", reviewer)

@@ -15,7 +15,6 @@ from alembic import op
 
 import techbio.core.db
 
-
 revision: str = "0002"
 down_revision: str | None = "0001"
 branch_labels: str | Sequence[str] | None = None

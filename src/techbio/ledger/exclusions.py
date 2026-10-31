@@ -12,6 +12,7 @@ computed when the item is shown so that trials ingested later are included.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -24,6 +25,37 @@ from techbio.ledger.names import assets_overlap
 from techbio.ledger.taxonomy import TAXONOMY_VERSION, Exclusion
 
 PARSER = "parser:ctgov_why_stopped_v1"
+MAX_CANDIDATES = 15
+GENERIC_ARMS = ("placebo", "standard of care", "saline", "vehicle", "best supportive care")
+_STOP = {
+    "study",
+    "studies",
+    "trial",
+    "trials",
+    "patient",
+    "patients",
+    "participants",
+    "population",
+    "with",
+    "from",
+    "that",
+    "this",
+    "following",
+    "related",
+    "termination",
+    "terminated",
+    "withdrawn",
+    "benefit",
+    "clinical",
+    "group",
+    "lack",
+    "data",
+    "results",
+    "proposed",
+    "overlapping",
+    "demonstrated",
+    "foreseeable",
+}
 
 
 def record_exclusion(
@@ -89,10 +121,29 @@ def _close_open_events(
         )
 
 
-def link_candidates(conn: Connection, sponsor_id: str, nct_id: str) -> list[dict[str, Any]]:
-    """The sponsor's other registry records, those sharing an intervention name first."""
-    me = conn.execute(select(trials.c.interventions).where(trials.c.nct_id == nct_id)).first()
-    mine = [i["name"] for i in (me.interventions if me else None) or []]
+def _drugs(interventions: list[dict[str, Any]] | None) -> list[str]:
+    return [
+        i["name"]
+        for i in interventions or []
+        if i.get("name") and not any(g in i["name"].lower() for g in GENERIC_ARMS)
+    ]
+
+
+def _words(s: str | None) -> set[str]:
+    return {w for w in re.findall(r"[a-z][a-z-]{3,}", (s or "").lower()) if w not in _STOP}
+
+
+def link_candidates(
+    conn: Connection, sponsor_id: str, nct_id: str, limit: int = MAX_CANDIDATES
+) -> list[dict[str, Any]]:
+    """The sponsor's other registry records most likely to be the cited trial: same drug first
+    (placebo and other generic arms ignored), then the words the stop reason shares with the
+    trial's title and conditions, then trials stopped early, then completed, then ongoing."""
+    me = conn.execute(
+        select(trials.c.interventions, trials.c.why_stopped).where(trials.c.nct_id == nct_id)
+    ).first()
+    mine = _drugs(me.interventions if me else None)
+    reason = _words(me.why_stopped if me else None)
     rows = (
         conn.execute(
             select(
@@ -100,27 +151,39 @@ def link_candidates(conn: Connection, sponsor_id: str, nct_id: str) -> list[dict
                 trials.c.brief_title,
                 trials.c.overall_status,
                 trials.c.interventions,
+                trials.c.conditions,
                 trials.c.phases,
             ).where(trials.c.sponsor_id == sponsor_id, trials.c.nct_id != nct_id)
         )
         .mappings()
         .all()
     )
+    # A cited trial was usually stopped early; completed ones next, ongoing ones last.
+    status_rank = {"TERMINATED": 0, "SUSPENDED": 0, "WITHDRAWN": 1, "COMPLETED": 2}
     out = []
     for r in rows:
-        names = [i["name"] for i in r["interventions"] or []]
+        names = _drugs(r["interventions"])
+        shared = bool(mine and names and assets_overlap(mine, names))
+        overlap = len(reason & _words(" ".join([r["brief_title"] or "", *(r["conditions"] or [])])))
         out.append(
             {
                 "nct_id": r["nct_id"],
                 "title": r["brief_title"],
                 "status": r["overall_status"],
                 "phases": r["phases"],
-                "shared_intervention": bool(mine and names and assets_overlap(mine, names)),
+                "shared_intervention": shared,
+                "reason_overlap": overlap,
             }
         )
-    stopped = {"TERMINATED", "SUSPENDED", "WITHDRAWN", "COMPLETED"}
-    out.sort(key=lambda c: (not c["shared_intervention"], c["status"] not in stopped, c["nct_id"]))
-    return out
+    out.sort(
+        key=lambda c: (
+            not c["shared_intervention"],
+            -c["reason_overlap"],
+            status_rank.get(c["status"], 3),
+            c["nct_id"],
+        )
+    )
+    return out[:limit]
 
 
 def set_link(conn: Connection, nct_id: str, linked_nct_id: str | None, by: str) -> None:

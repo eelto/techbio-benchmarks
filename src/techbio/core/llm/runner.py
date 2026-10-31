@@ -108,14 +108,14 @@ def run(
 
     by_key = dict(todo)
 
-    def _settle(resp: LLMResponse, reserved: float) -> None:
+    def _settle(resp: LLMResponse, reserved: float, batch_id: str | None = None) -> None:
         req = by_key[resp.cache_key]
         if resp.ok or resp.tokens_out:
             resp.cost_usd = price_tokens(
                 model, resp.tokens_in, resp.tokens_out, resp.tokens_cached, batch=batch
             )
         guard.settle(model_key, reserved, resp.cost_usd, resp.tokens_in, resp.tokens_out)
-        cache.put(req, model, resp, run_id)
+        cache.put(req, model, resp, run_id, batch_id=batch_id)
         results[resp.cache_key] = resp
 
     if batch:
@@ -132,7 +132,7 @@ def run(
             per = reserved / max(len(out), 1)
             for resp in out:
                 if resp.cache_key in by_key:
-                    _settle(resp, per)
+                    _settle(resp, per, batch_id)
             pending.pop(batch_id)
             _save_pending(pending)
             todo = [(k, r) for k, r in todo if k not in results]
@@ -157,7 +157,7 @@ def run(
             out = _wait(provider, batch_id, say)
             per = reserved / max(len(out), 1)
             for resp in out:
-                _settle(resp, per)
+                _settle(resp, per, batch_id)
             guard.release(max(reserved - per * len(out), 0.0))
             pending.pop(batch_id)
             _save_pending(pending)

@@ -251,3 +251,33 @@ def test_exclusions_export_has_reasons_and_links_but_no_registry_text(engine, sp
     assert "withdrawn_citing_other_trial" in body and "NCT01234567" in body
     assert "https://clinicaltrials.gov/study/NCT09999999" in body
     assert why[:20] not in body
+
+
+def test_link_candidates_rank_the_cited_trial_first(engine, sponsor, tmp_path):
+    from techbio.ledger.exclusions import link_candidates
+
+    for nct, drug, title in [
+        ("NCT00000001", "Placebo", "A study of tirzepatide in obesity"),
+        ("NCT00000002", "baricitinib", "A study of baricitinib in atopic dermatitis"),
+        ("NCT05592275", "LY3540378", "A Study of LY3540378 in Worsening Chronic Heart Failure"),
+    ]:
+        s = study(nct, "TERMINATED", 300, "x", phases=("PHASE2",), drug=drug)
+        s["protocolSection"]["identificationModule"]["briefTitle"] = title
+        store(engine, sponsor, tmp_path, s)
+    store(
+        engine,
+        sponsor,
+        tmp_path,
+        study(
+            "NCT06598631",
+            "WITHDRAWN",
+            0,
+            "following the termination of a related heart failure study that demonstrated no benefit",
+            phases=("PHASE2",),
+            drug="Placebo",  # placebo arms never count as a shared drug
+        ),
+    )
+    with engine.connect() as c:
+        cands = link_candidates(c, sponsor, "NCT06598631")
+    assert cands[0]["nct_id"] == "NCT05592275" and cands[0]["reason_overlap"] == 2
+    assert not any(c["shared_intervention"] for c in cands)

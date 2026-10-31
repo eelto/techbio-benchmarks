@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from techbio.core.db import events, labels, promises, quote_checks, resolutions, review_queue
+from techbio.core.db import (
+    completions,
+    events,
+    labels,
+    promises,
+    quote_checks,
+    resolutions,
+    review_queue,
+)
 from techbio.core.llm import runner
 from techbio.core.llm.cache import LLMResponse
 from techbio.ledger.extract import run_extraction
@@ -239,6 +247,13 @@ def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake
     (fuzzy,) = [r for r in ext if r["method"] == "fuzzy"]
     assert fuzzy["matched_span"].startswith("The Company remains on track")
     assert [r["role"] for r in rows if r["role"] != "extractor"] == ["tiebreak"]
+    # Batch mode is recorded per completion (deviations list: it changes price, not outputs).
+    with engine.connect() as c:
+        modes = {
+            (r.provider, r.batch_id is not None)
+            for r in c.execute(select(completions.c.provider, completions.c.batch_id))
+        }
+    assert modes == {("anthropic", True), ("openai", True), ("google", False)}
 
     q = summary(engine)["quote_checks"]
     assert (q["checked"], q["dropped"], q["fuzzy_kept"]) == (5, 1, 1)

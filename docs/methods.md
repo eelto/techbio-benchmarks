@@ -62,6 +62,12 @@ evaluated provider). Proposed default: yes.
   used a different setup (zero-shot, letter answer, no "insufficient information" option). Older
   models with published preprint scores are run both ways, and the measured gap is listed in the
   validation report's deviations.
+- **Batch and synchronous calls:** most calls use providers' batch APIs, which are cheaper. Gemini
+  (inside Inspect, where batch mode can't use thinking) and Meta (no batch API) run synchronously,
+  at full price, so that every model gets the same harness and settings (operator decision O.2,
+  2026-10-30). Batch mode changes price and latency, not the request: the same model version,
+  prompt and settings are sent either way, and it is not part of the completion cache key. The
+  deviations list records this, and every stored completion records whether it came from a batch.
 - **Samples and intervals:** one sample per item, with 95% intervals from an item-level bootstrap.
   The LAB-Bench headline run for the top three models gets a second sample, and the seed-to-seed
   difference is reported.

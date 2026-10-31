@@ -96,7 +96,9 @@ tables named in the brief are marked ★. The others are additions I'm proposing
 | `label_sources` | label_id FK · source_id FK · passage_ref JSON (char offsets) | Gives the review tool its exact passages. Never exported. |
 | ★ `promises` | promise_id PK · event_id FK · statement_date · guided_text ("mid-2027") · guided_start · guided_end · guided_precision · actual_date? · source_id FK | The slip model input. |
 | ★ `extractions` | extraction_id PK · source_id FK · event_id? · field · value JSON · confidence · quote_spans JSON · quote_verified · model_version · prompt_hash · completion_key FK | One row per model per field. |
-| `review_queue` | item_id PK · event_id FK · field · reason (disagreement \| low_confidence \| quote_unverified \| event_link_ambiguous \| tiebreak_abstained \| operator_flag \| outcome_confirmation \| parse_failed) · status · created_at · closed_label_id? | Queue size is reported in every refresh. |
+| `review_queue` | item_id PK · event_id FK · field · reason (disagreement \| low_confidence \| quote_unverified \| event_link_ambiguous \| tiebreak_abstained \| operator_flag \| outcome_confirmation \| parse_failed \| exclusion_link) · status · created_at · closed_label_id? | Queue size is reported in every refresh. |
+| `exclusions` | exclusion_id PK · nct_id UNIQUE · sponsor_id FK · source_id FK · reason (withdrawn_before_enrollment \| withdrawn_citing_other_trial) · enrolled · linked_nct_id? · linked_by · taxonomy_version · recorded_at | Registry records that are not events (taxonomy v1.1 §1). Exported with reasons and links, never the registry's text. |
+| `quote_checks` | check_id PK · run_id · source_id FK · model_key · role (extractor \| tiebreak) · claimed_quote · matched_span · score · method (exact \| fuzzy \| rejected) · accepted · reject_reason · threshold · matcher_version | Every quote check. Local only (source text). Feeds the drop rate and the spot-check sample. |
 | `resolutions` | event_id PK/FK · label_id FK · primary_source_id FK **NOT NULL** · event_date · confirmed_recorded_at · taxonomy_version · void_reason? | The schema itself enforces S9. Binary outcome is derived from the label plus the taxonomy version. `void_reason` is set only under the narrow void rule (taxonomy §4), and voided events are exported with it. A CRL resolves from the sponsor's filing. The FDA letter, when published, is a later label version and never changes the resolution. |
 
 ### Arena
@@ -160,25 +162,41 @@ tables named in the brief are marked ★. The others are additions I'm proposing
 8. Summary: new events, resolutions, queue size, spend.
 
 **Extraction routing**, per statement (as built in ledger v0, `ledger/extract.py`):
-- Each model returns statements, each with one verbatim supporting quote. A statement whose quote
-  isn't found verbatim in the source is **dropped** (its extraction rows are kept with
-  `quote_verified = false` and counted in the run summary). *Changed from the plan, which queued
-  them: queuing every paraphrase would flood the queue. Easy to revert if you prefer.*
+- Each model returns statements, each with one supporting quote, checked against the full source
+  text (`ledger/quotes.py`, operator decision Q.3 of 2026-10-30):
+  - **exact** (modulo whitespace, curly quotes, dashes, case) → kept;
+  - **near-verbatim** → kept: rapidfuzz partial-ratio score ≥ 0.8 against the best-aligned source
+    span, **and** every identifier-like token of the quote (anything with a digit or two capitals:
+    `EXT-202`, `SUMMIT`, `2027`, `2b`) occurs at that place in the source, **and** the quote and the
+    span agree on negation. The two guards are part of the rule: on score alone, "met its primary
+    endpoint" matches "did not meet its primary endpoint" at 0.86, and `EXT-303` matches `EXT-202`;
+  - otherwise **dropped**. Quotes under 30 characters must be exact.
+  - Every check, kept or dropped, is a row in `quote_checks` with the model's claimed quote, the
+    nearest source span, the score, the reason and the matcher version. Each refresh summary reports
+    the drop rate overall and per document (7-day window), and `ledger report` prints a random sample
+    of 10 drops for the operator's spot-check. `quote_checks` never leaves the machine: claimed
+    quotes and spans are source text.
 - Statements are paired across models by event type, asset (any shared name or code) and trial.
 - Both models agree on every compared field (kind, timing window after deterministic parsing, event
   date, phase, application kind, NCT ID, reserved fields), and reserved-field confidence ≥ τ:
   auto-accept (`auto-agreement:<m1>+<m2>`).
 - A non-reserved field disagrees: the tie-break model must pick A or B and quote the deciding
-  sentence verbatim (`model-adjudicated:<m3>`). "Neither", or an unverifiable quote, goes to the
-  queue as `tiebreak_abstained`.
+  sentence (`model-adjudicated:<m3>`), checked by the same quote rule. "Neither", or a quote that
+  fails the check, goes to the queue as `tiebreak_abstained`.
 - Only one model found the statement: the tie-break decides whether it exists, unless the statement
   carries a reserved field, in which case it goes to the human queue.
 - Reserved fields go to the human queue on disagreement or confidence below τ (Q-C11). **The stop
-  subtype (`result_subtype`) is treated as reserved too**, because it decides scored vs void under
-  the taxonomy v1 void rule.
+  subtype (`result_subtype`) and the stop's data trigger (`stop_data_trigger`) are reserved too**
+  (operator-confirmed 2026-10-30), because together they decide scored vs void under taxonomy v1.1.
 - An accepted statement that matches more than one existing event goes to the queue as
   `event_link_ambiguous`.
-- Federal Register AdCom notices are parsed without a model (`deterministic`, `parser:fedreg_adcom_v1`).
+- Federal Register AdCom notices are parsed without a model (`deterministic`, `parser:fedreg_adcom_v1`),
+  operator-confirmed 2026-10-30.
+- CT.gov records that are not events (withdrawn before enrollment, or withdrawn citing another
+  trial's data) never reach a model. They become `exclusions` rows (`ledger/exclusions.py`). A
+  record that cites another trial by NCT number is linked by the parser; one that cites it only in
+  words goes to the queue as `exclusion_link`, and the operator picks the cited trial in
+  `ledger review`.
 
 **Agreement rules:**
 

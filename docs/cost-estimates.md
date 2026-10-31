@@ -191,7 +191,8 @@ The tie-break model accounts for about 80% of ledger cost.
 The arena is now the largest line. Its cost is set mostly by events per round and by how many
 superseded versions stay in (Q-C6).
 
-**Hard caps** (`config/budget.yaml`), each about 1.5× its mid estimate:
+**Hard caps** (`config/budget.yaml`). The proposals were about 1.5× each mid estimate; the operator
+set the arena, pilot and monthly caps on 2026-10-30 (decision O.3):
 
 | Job | Cap | Status |
 |---|---|---|
@@ -199,11 +200,11 @@ superseded versions stay in (Q-C6).
 | monthly limit on the standing approval | $40 | open (Q-M3) |
 | ledger bootstrap | $75 | open (Q-M4); needs its own go-ahead after the dry-run |
 | backfill | $150 | open (Q-M4) |
-| arena round | $85 | open (Q-M4) |
-| harness pilot | $125 | open (Q-M4) |
+| arena round | **$60** | **decided 2026-10-30** (O.3). Mid estimate $32 at 30 events; $54 at 50. |
+| harness pilot | **$100** | **decided 2026-10-30** (O.3). Mid estimate $81. |
 | harness launch run, second seed, uncapped run | 1.5× the pilot-measured estimate, per model and in total, set at your go-ahead | |
 | model-day | 1.5× that model's measured anchor cost | |
-| monthly operating cap (ledger plus arena) | $200 | open (Q-M2) |
+| monthly operating cap (ledger plus arena jobs) | **$150** | **decided 2026-10-30** (O.3). A typical month is about $105 at mid (two rounds about $64, daily ledger up to the $40 standing limit). One-off ledger jobs count toward it as the code stands (see Q-G11). |
 
 **Two layers of protection:** provider console spend limits on the project-scoped keys are the
 backstop, and these per-run caps are the first line. The harness and model-day runs are always

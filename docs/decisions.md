@@ -59,3 +59,61 @@ new entry and points back.
 |---|---|
 | E.1 | Proceed to ledger v0: next 90 days of catalysts plus the last 90 days resolved, `date_type` and slip tracking, review tool working, queue size reported. PR with write-up, sample rows, and spend. Flag anything in the taxonomy that the first real events don't fit. |
 | E.2 | **No paid calls beyond the standing ingestion approval until the operator says go on the pilot.** One-off ledger jobs above $3/day (the bootstrap) still need a dry-run and an explicit go-ahead. |
+
+---
+
+## 2026-10-30 · Ledger v0 review, second round (operator)
+
+IDs in this entry are prefixed by topic (T taxonomy, Q code choices, O open questions, N next) so
+they don't collide with the first entry's A–E.
+
+### T. Taxonomy (v1 → v1.1, `docs/taxonomy.md`)
+
+| # | Decision | Closes |
+|---|---|---|
+| T.1 | **Strategic/business stop after enrollment: void for endpoint scoring unless a data trigger is documented** (interim analysis, futility analysis, DSMB recommendation), **in which case it is scored as "missed"**. Either way, it is recorded with the enrolled-patient count under a new explanation category, **`strategic_stop_after_enrollment`**, so it can be reported as a pattern. Rationale (operator): a "strategic" stop after hundreds of patients is often a data decision presented as a business one, and surfacing that is the point of the ledger. Example: NCT04396236 (Lilly, 847 enrolled). | G5 (2) |
+| T.2 | **Withdrawn before enrollment: not an event; excluded.** Example: NCT05951205. | ledger v0 flag |
+| T.3 | **Withdrawn citing another trial's data: not an event; excluded and linked to that trial's event.** Example: NCT06598631. | ledger v0 flag |
+| T.4 | **Stopped for failure to enroll: void, "operational". Confirmed.** Example: NCT05074420. | G5 (1) |
+| T.5 | All four go in `docs/taxonomy.md` with these examples. | — |
+
+### Q. Code choices
+
+| # | Decision |
+|---|---|
+| Q.1 | Stop subtype reserved for human review: **keep**. |
+| Q.2 | Fixed (non-model) AdCom parser: **keep**. |
+| Q.3 | **Verbatim-quote rule changed.** Fuzzy matching (threshold about 0.8) accepts near-verbatim quotes. Statements below the threshold are dropped but logged with the model's claimed quote and the nearest source span. The drop rate per document is reported, and a random sample of 10 drops is surfaced in each refresh summary for the operator's spot-check. Rationale (operator): "Paraphrase is the signal, not noise." |
+
+### O. Open questions
+
+| # | Decision | Closes |
+|---|---|---|
+| O.1 | **LitQA2: official setup, no paper text.** Caching on shared instructions only. | G1 |
+| O.2 | **Gemini and Meta are not batchable: accept the premium.** Keep the harness uniform. The deviations list notes that batch mode does not change outputs. | G2 |
+| O.3 | **Caps: monthly operating $150; arena $60 per round; harness pilot $100.** | M2; M4 (arena, pilot) |
+
+### N. Next, in order
+
+| # | Step |
+|---|---|
+| N.1 | `git init` and commit in the current folder now, before moving. **Done 2026-10-30:** root commit on `main`, work on `milestone/ledger-v0`. |
+| N.2 | After the operator confirms `.env` and `gh auth`: move to the repo, push, open the ledger v0 PR. |
+| N.3 | Run the free EDGAR + ClinicalTrials.gov ingestion (1–2 hours). |
+| N.4 | Run the 50-document extraction pilot (about $0.40) and report the agreement rate per field and the queue size it implies. |
+| N.5 | Bootstrap dry-run; stop and ask for the go-ahead with the real number. |
+
+### How these were implemented (for review)
+
+- **T.1:** the data trigger is a new reserved field, `stop_data_trigger`, extracted alongside the stop
+  subtype and never tie-broken. The category is derived by the ledger (`taxonomy.explanation_category`),
+  not offered to the extractors; the sponsor's stated reason is kept in `stated_explanation_category`.
+  The enrolled count comes from the CT.gov record (actual enrollment). Resolutions store `scored_as`.
+  Taxonomy version → v1.1.
+- **T.2, T.3:** a new `exclusions` table filled at CT.gov ingestion, so these records never reach a
+  model. NCT numbers in the stop reason are linked automatically; descriptions in words go to the queue
+  as `exclusion_link`. An open event for an excluded trial is closed as `excluded`.
+- **Q.3:** threshold 0.8 on rapidfuzz's partial ratio, plus two guards that are part of the rule:
+  identifiers (codes, trial names, numbers, dates) must match, and negation must agree. Without them,
+  "met its primary endpoint" matches "did not meet its primary endpoint" at 0.86. Every check is logged
+  in `quote_checks` (local only).
