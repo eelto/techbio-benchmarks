@@ -1,0 +1,12 @@
+# Arena settings. The forecasting code lands at Milestone 2; these values are decided now.
+version: 1
+cadence_days: 14
+window_days: [21, 90]
+samples_per_model: 2                    # forecast = mean of the draws; spread published; draws stored
+seed_param: set_if_supported            # set and record a seed wherever the provider accepts one
+power_rule_min_n: 100
+logloss_clip_eps: 0.001
+market_baseline:
+  venue: kalshi
+  terms_confirmed: false                # operator is reading Kalshi's terms
+  export_prices: false                  # until true: export only beat-market flags and aggregates

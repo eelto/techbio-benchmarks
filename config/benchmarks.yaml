@@ -1,0 +1,9 @@
+# Harness settings land at Milestone 3. The denylist is enforced from day one (test_no_biosecurity).
+version: 1
+denylist:                               # permanent; never evaluated, never exported
+  - VCT
+  - Virology Capabilities Test
+  - WMDP
+  - WMDP-Bio
+  - ABC-Bench
+  - any biosecurity benchmark

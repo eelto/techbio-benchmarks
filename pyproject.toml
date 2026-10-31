@@ -1,0 +1,50 @@
+[project]
+name = "techbio-benchmarks"
+version = "0.1.0"
+description = "Independent tracker of frontier AI models on biology research tasks, plus a biotech-catalyst forecasting arena."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "sqlalchemy>=2.1,<2.2",
+    "alembic>=1.20,<2",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.2",
+    "httpx>=0.28,<0.29",
+    "typer>=0.27",
+    "rich>=15",
+    "lxml>=6.1",
+    "python-ulid>=4.1",
+    "pydantic>=2.14,<3",
+    "anthropic>=2.3,<3",
+    "openai>=3.41,<4",
+    "google-genai>=2.34,<3",
+]
+
+[project.scripts]
+techbio = "techbio.cli:app"
+ledger = "techbio.ledger.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=9.2", "ruff>=0.17", "hypothesis>=6.170", "respx>=0.23"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/techbio"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["network: hits a live free API (deselected by default in CI)"]
