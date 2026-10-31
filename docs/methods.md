@@ -31,8 +31,8 @@ Annual holdings disclosure: _[first disclosure, date]_.
 |---|---|---|---|
 | _none yet_ | | | |
 
-Every provider is offered the same terms (`docs/credit-request-email.md`): disclosure here, no
-influence on models or settings, results published regardless, no preview.
+Every provider is offered the same terms: disclosure here, no influence on models or settings,
+results published regardless, no preview.
 
 ### Pending disclosure (operator to decide, Q-E2)
 
