@@ -60,7 +60,9 @@ TIEBREAK_SHARE = 0.2  # planning assumption until the pilot measures it
 
 
 def _nullable_enum(values: tuple[str, ...]) -> dict[str, Any]:
-    return {"type": ["string", "null"], "enum": [*values, None]}
+    # anyOf, not "type": ["string", "null"]: Anthropic rejects an enum value such as "2" under a
+    # type list (every pilot request, 2026-10-31).
+    return {"anyOf": [{"type": "string", "enum": list(values)}, {"type": "null"}]}
 
 
 STATEMENT_SCHEMA: dict[str, Any] = {
@@ -562,6 +564,7 @@ def run_extraction(
             m = model_cfg(k)
             reqs = [build_request(d, k) for d in docs]
             out = runner.run(engine, guard, k, reqs, run)
+            _note_errors(stats, k, out)
             for d, r in zip(docs, reqs, strict=True):
                 key = cache_key(r, m)
                 keys.setdefault(d.src["source_id"], {})[k] = key
@@ -572,9 +575,9 @@ def run_extraction(
         tb_jobs: list[tuple[Doc, Statement, Cand | None, Cand | None, list[str]]] = []
         for d in docs:
             sid = d.src["source_id"]
-            got = responses.get(sid, {})
+            got = {k: r for k, r in responses.get(sid, {}).items() if r.ok}
             if set(got) != set(EXTRACTORS):
-                continue  # stopped by the cap; the document stays pending
+                continue  # stopped by the cap or an error; the document stays pending
             ca = parse_candidates(EXTRACTORS[0], got[EXTRACTORS[0]], d)
             cb = parse_candidates(EXTRACTORS[1], got[EXTRACTORS[1]], d)
             with engine.begin() as conn:
@@ -648,6 +651,16 @@ def run_extraction(
     return {"prefilter": pf, **stats, "spend": summary}
 
 
+def _note_errors(stats: dict[str, Any], model_key: str, out: dict[str, LLMResponse]) -> None:
+    """Count a model's failed responses, with up to three distinct messages, in the job summary."""
+    bad = [r.error for r in out.values() if not r.ok]
+    if bad:
+        stats.setdefault("errors", {})[model_key] = {
+            "n": len(bad),
+            "messages": list(dict.fromkeys(bad))[:3],
+        }
+
+
 def _payload(a: Cand | None, b: Cand | None) -> dict[str, Any]:
     return {
         "statement": (a or b).st.to_json(),
@@ -697,7 +710,7 @@ def _run_tiebreaks(
     m = model_cfg(TIEBREAK)
     reqs = [_tiebreak_request(d, a, b, disputed, TIEBREAK) for d, _st, a, b, disputed in jobs]
     out = runner.run(engine, guard, TIEBREAK, reqs, run)
-    stats["tiebreak_failed"] = sum(1 for r in out.values() if not r.ok)  # capped or errored
+    _note_errors(stats, TIEBREAK, out)
     for (d, st, a, b, disputed), req in zip(jobs, reqs, strict=True):
         resp = out.get(cache_key(req, m))
         with engine.begin() as conn:
@@ -773,6 +786,7 @@ def _compare_tiebreaks(engine: Engine, guard: SpendGuard, run: str, jobs, reqs, 
         _tiebreak_request(d, a, b, disputed, TIEBREAK_REFERENCE) for d, _st, a, b, disputed in jobs
     ]
     ref_out = runner.run(engine, guard, TIEBREAK_REFERENCE, ref_reqs, run)
+    _note_errors(stats, TIEBREAK_REFERENCE, ref_out)
     fields: dict[str, dict[str, int]] = {}
     disagreements = []
     for (d, _st, _a, _b, disputed), req, ref_req in zip(jobs, reqs, ref_reqs, strict=True):

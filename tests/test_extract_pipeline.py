@@ -83,6 +83,8 @@ class Fake:
     def _resp(self, key, req, model_key):
         self.calls.append((model_key, req))
         body = self.answers(model_key, req)
+        if isinstance(body, Exception):  # the provider answered with an error
+            return LLMResponse(key, "", error=f"{type(body).__name__}: {body}")
         return LLMResponse(key, json.dumps(body), tokens_in=1000, tokens_out=300)
 
     def submit(self, items, model):
@@ -347,3 +349,68 @@ def test_tiebreak_server_is_checked_before_any_paid_call(
     assert f.calls == []
     with engine.connect() as c:
         assert c.execute(select(sources.c.extract_status)).scalar_one() == "none"
+
+
+def test_a_failed_extractor_leaves_the_document_pending(engine, sponsor, fake, tmp_path):
+    # Pilot 2026-10-31: every Haiku request was rejected, and B's statements were then tie-broken
+    # as if A had found nothing. An error is not an empty answer.
+    def a_fails(model_key, req):
+        if model_key == "extractor_a":
+            return ValueError("invalid_request_error: Invalid schema")
+        return answers(model_key, req)
+
+    f = fake(a_fails)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    out = run_extraction(engine, execute=True)
+    assert (out["accepted"], out["queued"], out["tiebreaks"]) == (0, 0, 0)
+    assert not any(m.startswith("tiebreak") for m, _ in f.calls)
+    assert out["errors"] == {
+        "extractor_a": {"n": 1, "messages": ["ValueError: invalid_request_error: Invalid schema"]}
+    }
+    with engine.connect() as c:
+        assert c.execute(select(sources.c.extract_status)).scalar_one() == "none"
+        assert c.execute(select(events)).first() is None
+    # Next run, the model answers: the document is extracted then.
+    fake(answers)
+    assert run_extraction(engine, execute=True)["accepted"] == 2
+
+
+def test_reference_errors_are_reported(engine, sponsor, fake, tmp_path):
+    def ref_fails(model_key, req):
+        if model_key == "tiebreak_reference":
+            return RuntimeError("429 RESOURCE_EXHAUSTED")
+        return answers(model_key, req)
+
+    fake(ref_fails)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    out = run_extraction(engine, execute=True, compare_tiebreak=True)
+    assert out["errors"]["tiebreak_reference"]["n"] == 1
+    assert out["tiebreak_comparison"]["disagreements"][0]["reference"] is None
+    assert out["accepted"] == 2  # the local tie-break still applies
+
+
+def test_optional_enums_avoid_type_lists():
+    # Anthropic rejects an enum value such as "2" under "type": ["string", "null"] (found
+    # 2026-10-31 with the free token-count endpoint). Optional enums use anyOf instead.
+    from techbio.ledger.extract import SCHEMA, TB_SCHEMA
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "enum" in node:
+                assert not isinstance(node.get("type"), list), node
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(SCHEMA)
+    walk(TB_SCHEMA)
+    phase = SCHEMA["properties"]["statements"]["items"]["properties"]["phase"]
+    assert phase == {
+        "anyOf": [{"type": "string", "enum": ["2", "2b", "2/3", "3"]}, {"type": "null"}]
+    }
