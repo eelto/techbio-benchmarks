@@ -1,9 +1,9 @@
-"""Thin provider adapters over each official SDK.
+"""Thin provider adapters over each official SDK, plus a local Ollama model over its HTTP API.
 
-Batch where the provider offers it on our path (Anthropic, OpenAI); synchronous otherwise (Google
-tie-breaks are few). No sampling parameters are sent: current flagships reject temperature, and the
-same rule applies to every vendor. Reasoning settings come from config/models.yaml and are recorded
-in the cache key.
+Batch where the provider offers it on our path (Anthropic, OpenAI); synchronous otherwise (Google,
+and the local model, which has no batch path). No sampling parameters are sent: current flagships
+reject temperature, and the same rule applies to every vendor. The local model gets only a fixed
+seed. Reasoning settings and seeds come from config/models.yaml and are recorded in the cache key.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 import io
 import json
 from typing import Any, Protocol
+
+import httpx
 
 from techbio.core.config import secret
 from techbio.core.llm.cache import LLMRequest, LLMResponse
@@ -242,7 +244,79 @@ class GoogleSync:
         )
 
 
-def provider_for(model: dict[str, Any]) -> AnthropicBatch | OpenAIBatch | GoogleSync:
+# --------------------------------------------------------------------------- Ollama (local)
+
+
+class OllamaSync:
+    """An open-weight model on the operator's machine: no spend, and nothing leaves the machine.
+
+    `model_version` is `<tag>@sha256:<digest>`, the manifest digest Ollama reports. It is checked
+    against the server before the first call, so a tag that was pulled again can never answer under
+    the old version string (and its cached completions).
+    """
+
+    TIMEOUT_S = 900.0  # one call; the output cap bounds it at about 100 s on the Mac Studio
+
+    def __init__(self, model: dict[str, Any]) -> None:
+        self.url = model["endpoint"].rstrip("/")
+        self.tag, _, digest = model["model_version"].partition("@sha256:")
+        try:
+            r = httpx.get(f"{self.url}/api/tags", timeout=10)
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f"Ollama is not reachable at {self.url} ({type(e).__name__}); start it first"
+            ) from e
+        served = {m["name"]: m["digest"] for m in r.json().get("models", [])}
+        if self.tag not in served:
+            raise RuntimeError(f"{self.tag} is not installed in the Ollama at {self.url}")
+        if served[self.tag] != digest:
+            raise RuntimeError(
+                f"{self.tag} weights changed: the server has {served[self.tag][:12]}, "
+                f"config/models.yaml pins {digest[:12]}"
+            )
+
+    def call(self, key: str, req: LLMRequest, model: dict[str, Any]) -> LLMResponse:
+        body = {
+            "model": self.tag,
+            "stream": False,
+            "think": model.get("reasoning", {}).get("think", False),
+            "format": req.json_schema,
+            "options": {
+                "seed": model.get("seed"),
+                "num_predict": req.max_output_tokens,
+                "num_ctx": model.get("context_tokens", 32768),
+            },
+            "messages": [
+                {"role": "system", "content": req.system},
+                {"role": "user", "content": req.user},
+            ],
+        }
+        try:
+            r = httpx.post(f"{self.url}/api/chat", json=body, timeout=self.TIMEOUT_S)
+            r.raise_for_status()
+        except httpx.HTTPError as e:  # recorded; the runner leaves it uncached and the item queues
+            return LLMResponse(cache_key=key, text="", error=f"{type(e).__name__}: {e}"[:500])
+        data = r.json()
+        text = (data.get("message") or {}).get("content") or ""
+        done = data.get("done_reason")
+        error = None
+        if done == "length":
+            error = "max_tokens"
+        elif not text:
+            error = "empty"
+        return LLMResponse(
+            cache_key=key,
+            text=text,
+            tokens_in=data.get("prompt_eval_count", 0),
+            tokens_out=data.get("eval_count", 0),  # thinking included; Ollama doesn't split it
+            stop_reason=done,
+            error=error,
+            raw=data,
+        )
+
+
+def provider_for(model: dict[str, Any]) -> AnthropicBatch | OpenAIBatch | GoogleSync | OllamaSync:
     match model["provider"]:
         case "anthropic":
             return AnthropicBatch()
@@ -250,4 +324,6 @@ def provider_for(model: dict[str, Any]) -> AnthropicBatch | OpenAIBatch | Google
             return OpenAIBatch()
         case "google":
             return GoogleSync()
+        case "ollama":
+            return OllamaSync(model)
     raise NotImplementedError(f"provider {model['provider']!r} lands with the arena (Milestone 2)")

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from techbio.core.config import model_cfg
 from techbio.core.db import (
     completions,
     events,
@@ -15,6 +16,7 @@ from techbio.core.db import (
     quote_checks,
     resolutions,
     review_queue,
+    sources,
 )
 from techbio.core.llm import runner
 from techbio.core.llm.cache import LLMResponse
@@ -160,6 +162,9 @@ def test_pipeline_routes_agree_tiebreak_queue_and_review(engine, sponsor, fake, 
     out = run_extraction(engine, execute=True)
     assert out["accepted"] == 2 and out["tiebreaks"] == 1
     assert (out["quote_dropped"], out["quote_fuzzy"]) == (1, 1)
+    # The reference tie-breaker runs only when the pilot asks for the comparison.
+    assert "tiebreak_comparison" not in out
+    assert not any(m == "tiebreak_reference" for m, _ in f.calls)
 
     with engine.connect() as c:
         evs = {e["trial_name"]: e for e in c.execute(select(events)).mappings()}
@@ -220,8 +225,6 @@ def test_rerun_is_free(engine, sponsor, fake, tmp_path):
     run_extraction(engine, execute=True)
     n = len(f.calls)
     # Reset the document and run again: every completion comes from the cache.
-    from techbio.core.db import sources
-
     with engine.begin() as c:
         c.execute(sources.update().values(extract_status="none"))
     out = run_extraction(engine, execute=True)
@@ -253,7 +256,7 @@ def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake
             (r.provider, r.batch_id is not None)
             for r in c.execute(select(completions.c.provider, completions.c.batch_id))
         }
-    assert modes == {("anthropic", True), ("openai", True), ("google", False)}
+    assert modes == {("anthropic", True), ("openai", True), ("ollama", False)}
 
     q = summary(engine)["quote_checks"]
     assert (q["checked"], q["dropped"], q["fuzzy_kept"]) == (5, 1, 1)
@@ -269,3 +272,78 @@ def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake
     (s,) = drop_sample(engine, n=10)
     assert s["claimed_quote"] == drop["claimed_quote"] and s["nearest_span"] == drop["matched_span"]
     assert s["url"].endswith("src_1.htm") and s["model_key"] == "extractor_a"
+
+
+def test_pilot_compares_tiebreak_with_reference_but_labels_come_from_tiebreak(
+    engine, sponsor, fake, tmp_path
+):
+    def with_reference(model_key, req):
+        if model_key == "tiebreak_reference":
+            return {"choices": [{"field": "window", "choice": "B", "quote": SUMMIT_Q}]}
+        return answers(model_key, req)
+
+    f = fake(with_reference)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    out = run_extraction(engine, execute=True, compare_tiebreak=True)
+    assert out["tiebreaks"] == 1
+    cmp = out["tiebreak_comparison"]
+    assert cmp["fields"] == {"window": {"n": 1, "agree": 0}}
+    # Choices only: no quotes or other document text in the summary.
+    assert cmp["disagreements"] == [
+        {"source_id": "src_1", "field": "window", "tiebreak": "A", "reference": "B"}
+    ]
+    tb = [r for m, r in f.calls if m == "tiebreak"]
+    ref = [r for m, r in f.calls if m == "tiebreak_reference"]
+    assert len(tb) == len(ref) == 1 and ref[0].user == tb[0].user and ref[0].system == tb[0].system
+    # The local tie-breaker (cheap) runs before the reference.
+    order = [m for m, _ in f.calls if m.startswith("tiebreak")]
+    assert order == ["tiebreak", "tiebreak_reference"]
+    with engine.connect() as c:
+        ev = c.execute(select(events).where(events.c.trial_name == "SUMMIT")).mappings().one()
+        p = (
+            c.execute(select(promises).where(promises.c.event_id == ev["event_id"]))
+            .mappings()
+            .one()
+        )
+        tb_models = set(
+            c.execute(
+                select(completions.c.model_version).where(completions.c.provider == "ollama")
+            ).scalars()
+        )
+    # The reference never decides a label: A's window stands, adjudicated by the local model.
+    assert (str(p["guided_start"]), str(p["guided_end"])) == ("2027-05-01", "2027-08-31")
+    assert p["reviewer_kind"] == "model-adjudicated"
+    assert tb_models == {model_cfg("tiebreak")["model_version"]}
+
+
+def test_dry_run_prices_the_reference_only_when_comparing(engine, sponsor, fake, tmp_path):
+    f = fake(answers)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    plain = run_extraction(engine, execute=False)
+    compared = run_extraction(engine, execute=False, compare_tiebreak=True)
+    assert compared["est_usd"] > plain["est_usd"] > 0 and f.calls == []
+
+
+def test_tiebreak_server_is_checked_before_any_paid_call(
+    engine, sponsor, fake, monkeypatch, tmp_path
+):
+    f = fake(answers)
+
+    def provider(model):
+        if model["key"] == "tiebreak":
+            raise RuntimeError("Ollama is not reachable")
+        return f
+
+    monkeypatch.setattr(runner, "_provider", provider)
+    add_source(
+        engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
+    )
+    with pytest.raises(RuntimeError, match="not reachable"):
+        run_extraction(engine, execute=True)
+    assert f.calls == []
+    with engine.connect() as c:
+        assert c.execute(select(sources.c.extract_status)).scalar_one() == "none"

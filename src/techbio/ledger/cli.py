@@ -69,12 +69,34 @@ def extract(
     job_kind: Annotated[
         str, typer.Option(help="budget line in config/budget.yaml")
     ] = "ledger_extract",
+    sample: Annotated[
+        Path | None,
+        typer.Option(help="JSON sample file: run only its source_ids (listed by stratum)"),
+    ] = None,
+    compare_tiebreak: Annotated[
+        bool,
+        typer.Option(
+            "--compare-tiebreak",
+            help="pilot: also run the reference tie-breaker and report agreement (never applied)",
+        ),
+    ] = False,
 ) -> None:
     """Two-model extraction with tie-break and human queue. Dry run unless --execute."""
     from techbio.ledger.extract import run_extraction
 
+    source_ids = (
+        [i for ids in json.loads(sample.read_text())["source_ids"].values() for i in ids]
+        if sample
+        else None
+    )
     out = run_extraction(
-        get_engine(), execute=execute, approval=approval, limit=limit, job_kind=job_kind
+        get_engine(),
+        execute=execute,
+        approval=approval,
+        limit=limit,
+        job_kind=job_kind,
+        source_ids=source_ids,
+        compare_tiebreak=compare_tiebreak,
     )
     console.print(json.dumps(out, indent=1, default=str))
 

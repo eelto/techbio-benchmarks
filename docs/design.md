@@ -67,10 +67,12 @@ and spend code exists in exactly one place.
 - **Harness** uses Inspect AI, so that the official tasks and graders run unmodified. Token usage is
   read back from Inspect logs into `spend_ledger`.
 
-**Batch everywhere, with two exceptions** (both recorded in `models.yaml`, Q-G2):
+**Batch everywhere, with three exceptions** (all recorded in `models.yaml`; the first two are Q-G2):
 - Inspect's Gemini batch mode can't use thinking, so Gemini harness runs are synchronous unless we
   add our own batch client.
 - Meta's API has no batch endpoint, so Muse Wonder runs synchronously on every path.
+- The ledger tie-breaker is a local open-weight model (Ollama), with no batch path and no spend
+  (decisions P.1, 2026-10-31).
 
 **Prompt caching** covers shared instructions on every path. LitQA2 items carry no paper text in the
 official setup, so there is no shared paper context to cache (Q-G1).

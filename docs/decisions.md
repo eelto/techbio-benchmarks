@@ -117,3 +117,43 @@ they don't collide with the first entry's A–E.
   identifiers (codes, trial names, numbers, dates) must match, and negation must agree. Without them,
   "met its primary endpoint" matches "did not meet its primary endpoint" at 0.86. Every check is logged
   in `quote_checks` (local only).
+
+---
+
+## 2026-10-31 · Ledger tie-breaker (operator)
+
+### P. Tie-break model
+
+| # | Decision | Closes |
+|---|---|---|
+| P.1 | **The ledger tie-breaker is Ornith 1.5 122B, run locally,** replacing Gemini 4 Argon. It is an open-weight model (NVFP4) on the operator's Mac Studio, served by Ollama. Rationale: Argon tie-breaks were $69.70 of the $75.28 bootstrap estimate. Locally they cost $0, and excerpts never leave the machine. | — |
+| P.2 | **The extraction pilot checks it against Argon.** Argon answers the same disputes. Its choices are reported, never applied. If they disagree too often, the bootstrap stays on Argon. | — |
+
+### Measured before deciding (2026-10-31, local, $0)
+
+- **Thinking off:** "neither" or no answer on all three synthetic tie-breaks, and zero events found in
+  two real documents.
+- **Thinking on:** 3/3 synthetic tie-breaks correct, each with a verbatim quote, in 3–11 s.
+- **Speed:** reads about 2,000 tokens/s and writes about 80. Thinking length varies widely. As an
+  extractor on six real pilot documents it wrote 1,100–26,700 tokens (14 s to 6 min, about 2 min on
+  average).
+- **Not an extractor:** at that speed the 5,353 documents would take about 8 days, to save at most
+  $2.94.
+
+### How this was implemented (for review)
+
+- **Provider:** `core/llm/providers.py: OllamaSync`, over Ollama's HTTP API.
+  - `model_version` pins the manifest digest Ollama reports. The provider refuses to run if the server
+    has other weights under the tag, or the tag is missing.
+  - The digest is part of the version string, so it is also part of the cache key and of every
+    `model-adjudicated:` reviewer string.
+- **Settings:** thinking on, a fixed seed (in the cache key), and no other sampling parameters.
+  - Output is capped at 8,000 tokens. An answer that hits the cap is an error: never accepted, never
+    cached, and the item goes to the queue as `tiebreak_abstained`.
+- **Preflight:** the job checks the tie-break server before any extractor spends. A server that is down
+  fails the job with nothing spent and no document marked done.
+- **Comparison:** `ledger extract --compare-tiebreak` runs Argon after the local model, on the same
+  prompts. The summary carries choices only (no quotes or document text).
+  - The pilot's ~10 Argon calls run synchronously: a one-off, not worth a batch adapter.
+- **Estimates:** the tie-break count is now rounded up. The dry-run gives the local tie-break time
+  (about 9 h for the bootstrap, from the measured 80 tokens/s and 2,500 expected tokens per call).

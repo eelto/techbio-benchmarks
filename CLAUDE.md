@@ -61,7 +61,8 @@ below point there.
   the `spend_ledger` table. Every milestone PR includes it.
 - **Batch APIs for everything**, since nothing here is latency-sensitive. Synchronous calls are
   allowed only when a batch path doesn't exist, and the exception is documented in `models.yaml`
-  (today: Meta, and Gemini inside Inspect).
+  (today: Meta, Gemini inside Inspect, and the local ledger tie-breaker, which runs on the
+  operator's machine).
 - **Prompt caching:** the static instructions form the prompt prefix and variable content goes last.
 - **Reasoning budgets** are capped at the documented tier in `models.yaml` for every benchmark item and
   recorded with every completion. Uncapped runs are only for the single top model per benchmark, to

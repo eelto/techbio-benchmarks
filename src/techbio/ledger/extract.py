@@ -18,6 +18,7 @@ Per document:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import date
 from importlib import resources
@@ -52,6 +53,7 @@ console = Console(stderr=True)
 PROMPT_VERSION = "extract_v1"
 EXTRACTORS = ("extractor_a", "extractor_b")
 TIEBREAK = "tiebreak"
+TIEBREAK_REFERENCE = "tiebreak_reference"  # pilot only: checks the tie-breaker
 RESERVED = RESERVED_FIELDS
 COMPARED = ("kind", "phase", "application_kind", "nct_id", "window", "event_date", *RESERVED)
 TIEBREAK_SHARE = 0.2  # planning assumption until the pilot measures it
@@ -491,14 +493,23 @@ def _accept(
     stats["resolved"] += int(res.resolved)
 
 
-def estimate_job(engine: Engine, docs: list[Doc], job_kind: str):
+def tiebreak_keys(compare: bool) -> tuple[str, ...]:
+    return (TIEBREAK, TIEBREAK_REFERENCE) if compare else (TIEBREAK,)
+
+
+def estimate_job(engine: Engine, docs: list[Doc], job_kind: str, compare_tiebreak: bool = False):
     cache = CompletionCache(engine)
     reqs = {k: [build_request(d, k) for d in docs] for k in EXTRACTORS}
-    tb_n = int(len(docs) * TIEBREAK_SHARE)
-    reqs[TIEBREAK] = [build_request(d, TIEBREAK) for d in docs[:tb_n]]
+    tb_n = math.ceil(len(docs) * TIEBREAK_SHARE)
+    for k in tiebreak_keys(compare_tiebreak):
+        reqs[k] = [build_request(d, k) for d in docs[:tb_n]]
     expected = {k: int(model_cfg(k).get("expected_output_tokens", 1500)) for k in reqs}
     est = runner.estimate(job_kind, reqs, cache, expected)
     est.notes.append(f"tie-break assumed for {TIEBREAK_SHARE:.0%} of documents")
+    tps = model_cfg(TIEBREAK).get("output_tokens_per_s")
+    if tps:
+        hours = tb_n * expected[TIEBREAK] / tps / 3600
+        est.notes.append(f"local tie-break, one call at a time: about {hours:.1f} h")
     return est
 
 
@@ -510,6 +521,7 @@ def run_extraction(
     limit: int | None = None,
     job_kind: str = "ledger_extract",
     source_ids: list[str] | None = None,
+    compare_tiebreak: bool = False,
 ) -> dict[str, Any]:
     pf = run_prefilter(engine)
     docs = pending_docs(engine, limit, source_ids)
@@ -519,7 +531,7 @@ def run_extraction(
         return {"prefilter": pf, "documents": 0}
     guard = SpendGuard(engine, job_kind, run, execute=execute, approval=approval)
     try:
-        guard.authorize(estimate_job(engine, docs, job_kind))
+        guard.authorize(estimate_job(engine, docs, job_kind, compare_tiebreak))
     except DryRun as e:
         console.print(f"[cyan]{e}[/]")
         return {
@@ -541,6 +553,9 @@ def run_extraction(
         "quote_fuzzy": 0,
     }
     try:
+        # A local tie-break server that is down must stop the job before the extractors spend.
+        for k in tiebreak_keys(compare_tiebreak):
+            runner.preflight(k)
         responses: dict[str, dict[str, LLMResponse]] = {}
         keys: dict[str, dict[str, str]] = {}
         for k in EXTRACTORS:
@@ -624,7 +639,7 @@ def run_extraction(
 
         if tb_jobs:
             stats["tiebreaks"] = len(tb_jobs)
-            _run_tiebreaks(engine, guard, run, tb_jobs, stats)
+            _run_tiebreaks(engine, guard, run, tb_jobs, stats, compare_tiebreak)
     except Exception:
         status = "failed"
         raise
@@ -646,33 +661,43 @@ def _payload(a: Cand | None, b: Cand | None) -> dict[str, Any]:
     }
 
 
+def _tiebreak_request(
+    d: Doc, a: Cand | None, b: Cand | None, disputed: list[str], model_key: str
+) -> LLMRequest:
+    user = (
+        user_message(d)
+        + "\n\nCandidate A:\n"
+        + json.dumps(a.st.to_json() if a else None, indent=1)
+        + "\n\nCandidate B:\n"
+        + json.dumps(b.st.to_json() if b else None, indent=1)
+        + "\n\nDisputed fields: "
+        + ", ".join(disputed)
+    )
+    return LLMRequest(
+        model_key,
+        system_prompt() + TB_ADDENDUM,
+        user,
+        TB_SCHEMA,
+        "tiebreak",
+        int(model_cfg(model_key).get("max_output_tokens", 6000)),
+        tag=d.src["source_id"],
+    )
+
+
+def _choices(resp: LLMResponse | None) -> dict[str, str]:
+    try:
+        return {c["field"]: c["choice"] for c in resp.parsed()["choices"]}
+    except (AttributeError, json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
 def _run_tiebreaks(
-    engine: Engine, guard: SpendGuard, run: str, jobs, stats: dict[str, int]
+    engine: Engine, guard: SpendGuard, run: str, jobs, stats: dict[str, int], compare: bool = False
 ) -> None:
     m = model_cfg(TIEBREAK)
-    reqs = []
-    for d, _st, a, b, disputed in jobs:
-        user = (
-            user_message(d)
-            + "\n\nCandidate A:\n"
-            + json.dumps(a.st.to_json() if a else None, indent=1)
-            + "\n\nCandidate B:\n"
-            + json.dumps(b.st.to_json() if b else None, indent=1)
-            + "\n\nDisputed fields: "
-            + ", ".join(disputed)
-        )
-        reqs.append(
-            LLMRequest(
-                TIEBREAK,
-                system_prompt() + TB_ADDENDUM,
-                user,
-                TB_SCHEMA,
-                "tiebreak",
-                int(m.get("max_output_tokens", 6000)),
-                tag=d.src["source_id"],
-            )
-        )
+    reqs = [_tiebreak_request(d, a, b, disputed, TIEBREAK) for d, _st, a, b, disputed in jobs]
     out = runner.run(engine, guard, TIEBREAK, reqs, run)
+    stats["tiebreak_failed"] = sum(1 for r in out.values() if not r.ok)  # capped or errored
     for (d, st, a, b, disputed), req in zip(jobs, reqs, strict=True):
         resp = out.get(cache_key(req, m))
         with engine.begin() as conn:
@@ -735,3 +760,40 @@ def _run_tiebreaks(
                     {**_payload(a, b), "tiebreak": choices},
                 )
                 stats["queued"] += 1
+    if compare:
+        _compare_tiebreaks(engine, guard, run, jobs, reqs, out, stats)
+
+
+def _compare_tiebreaks(engine: Engine, guard: SpendGuard, run: str, jobs, reqs, out, stats) -> None:
+    """Pilot only: the reference model answers the same disputes, after the tie-breaker. Its
+    choices are counted against the tie-breaker's and never applied. The summary carries choices
+    only, never document text."""
+    m, ref_m = model_cfg(TIEBREAK), model_cfg(TIEBREAK_REFERENCE)
+    ref_reqs = [
+        _tiebreak_request(d, a, b, disputed, TIEBREAK_REFERENCE) for d, _st, a, b, disputed in jobs
+    ]
+    ref_out = runner.run(engine, guard, TIEBREAK_REFERENCE, ref_reqs, run)
+    fields: dict[str, dict[str, int]] = {}
+    disagreements = []
+    for (d, _st, _a, _b, disputed), req, ref_req in zip(jobs, reqs, ref_reqs, strict=True):
+        mine = _choices(out.get(cache_key(req, m)))
+        theirs = _choices(ref_out.get(cache_key(ref_req, ref_m)))
+        for f in disputed:
+            n = fields.setdefault(f, {"n": 0, "agree": 0})
+            n["n"] += 1
+            if mine.get(f) is not None and mine.get(f) == theirs.get(f):
+                n["agree"] += 1
+            else:
+                disagreements.append(
+                    {
+                        "source_id": d.src["source_id"],
+                        "field": f,
+                        "tiebreak": mine.get(f),
+                        "reference": theirs.get(f),
+                    }
+                )
+    stats["tiebreak_comparison"] = {
+        "reference": ref_m["model_version"],
+        "fields": fields,
+        "disagreements": disagreements,
+    }

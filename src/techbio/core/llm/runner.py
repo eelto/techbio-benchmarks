@@ -174,6 +174,12 @@ def run(
     return results
 
 
+def preflight(model_key: str) -> None:
+    """Construct the provider now, so one that can't run (a local server that is down, or serving
+    other weights) fails the job before anything is spent."""
+    _provider(model_cfg(model_key))
+
+
 def _provider(model: dict[str, Any]):
     from techbio.core.llm.providers import provider_for
 
