@@ -38,6 +38,7 @@ from techbio.ledger import prefilter
 from techbio.ledger.apply import Provenance, Statement, apply_statement
 from techbio.ledger.names import assets_overlap
 from techbio.ledger.quotes import QuoteMatch, match_quote, record_check
+from techbio.ledger.scope import CHECKED, facts, readout_scope, registry_trial
 from techbio.ledger.sources.ctgov import parse_study, stop_document
 from techbio.ledger.taxonomy import (
     ALL_RESULTS,
@@ -443,8 +444,15 @@ def _write_extraction_rows(
 
 
 def _queue(
-    conn, doc: Doc, reason: str, field: str, payload: dict[str, Any], event_id: str | None = None
+    conn,
+    doc: Doc,
+    reason: str,
+    field: str,
+    payload: dict[str, Any],
+    event_id: str | None = None,
+    closed_by: str | None = None,
 ) -> None:
+    """Open an item for the operator, or with `closed_by` record an automatic decision."""
     payload = {
         "source_id": doc.src["source_id"],
         "sponsor_id": doc.src["sponsor_id"],
@@ -460,10 +468,40 @@ def _queue(
             field=field,
             reason=reason,
             payload=payload,
-            status="open",
+            status="closed" if closed_by else "open",
             created_at=now(),
+            closed_at=now() if closed_by else None,
+            closed_by=closed_by,
         )
     )
+
+
+def _scope(conn, doc: Doc, sts: list[Statement]) -> tuple[str, str, dict[str, Any] | None]:
+    """The 2b rule (ledger/scope.py). Each candidate is checked against its own trial and the most
+    lenient verdict stands, so before routing a pair is dropped only when the registry rules out
+    every candidate: one candidate's wrong NCT number cannot sink the other."""
+    verdicts = [_scope_one(conn, doc, s) for s in sts]
+    return min(verdicts, key=lambda v: LENIENCY.index(v[0]), default=("in", "", None))
+
+
+LENIENCY = ("in", "ask", "out")
+
+
+def _scope_one(conn, doc: Doc, st: Statement) -> tuple[str, str, dict[str, Any] | None]:
+    if st.event_type != "readout" or st.phase not in CHECKED:
+        return "in", "", None
+    nct = st.nct_id or (doc.src["meta"].get("nct_id") if doc.src["type"] == "ctgov" else None)
+    t = registry_trial(conn, doc.src["sponsor_id"], nct, st.trial_name)
+    return (*readout_scope(st.phase, t), t)
+
+
+def _out_of_scope(
+    conn, doc: Doc, st: Statement, why: str, t: dict | None, stats: dict[str, int]
+) -> None:
+    """A readout the registry rules out never reaches the ledger; the drop stays on record."""
+    payload = {"statement": st.to_json(), "scope": why, "registry": facts(t)}
+    _queue(conn, doc, "scope_check", "phase", payload, closed_by="auto:registry")
+    stats["out_of_scope"] += 1
 
 
 def _accept(
@@ -474,6 +512,21 @@ def _accept(
     )
     if doc.src["type"] == "ctgov" and not st.nct_id:
         st.nct_id = doc.src["meta"].get("nct_id")  # the registry record is that trial
+    verdict, why, t = _scope(conn, doc, [st])
+    if verdict == "out":
+        _out_of_scope(conn, doc, st, why, t, stats)
+        return
+    if verdict == "ask":
+        payload = {
+            "statement": st.to_json(),
+            "reviewer": reviewer,
+            "reviewer_kind": reviewer_kind,
+            "scope": why,
+            "registry": facts(t),
+        }
+        _queue(conn, doc, "scope_check", "phase", payload)
+        stats["queued"] += 1
+        return
     res = apply_statement(conn, st, prov)
     if res.ambiguous:
         _queue(
@@ -553,6 +606,7 @@ def run_extraction(
         "resolved": 0,
         "quote_dropped": 0,
         "quote_fuzzy": 0,
+        "out_of_scope": 0,
     }
     try:
         # A local tie-break server that is down must stop the job before the extractors spend.
@@ -597,6 +651,10 @@ def run_extraction(
                 stats["quote_dropped"] += sum(1 for c in ca + cb if not c.quote_ok)
                 stats["quote_fuzzy"] += sum(1 for c in ca + cb if c.qm.method == "fuzzy")
                 for a, b in pair([c for c in ca if c.quote_ok], [c for c in cb if c.quote_ok]):
+                    verdict, why, t = _scope(conn, d, [c.st for c in (a, b) if c])
+                    if verdict == "out":  # before any tie-break or operator time is spent
+                        _out_of_scope(conn, d, (a or b).st, why, t, stats)
+                        continue
                     if a and b:
                         disputed = disputed_fields(a.st, b.st)
                         reserved = [f for f in disputed if f in RESERVED]

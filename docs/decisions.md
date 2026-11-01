@@ -188,3 +188,39 @@ they don't collide with the first entry's A–E.
   extractors re-run, with an estimate first.
 - The scoring version stays v1.1: the rule decides which company an event is filed under, not how any
   outcome is scored.
+
+| # | Decision | Closes |
+|---|---|---|
+| R.2 | **Single-arm and dose-comparison Phase 2s stay out, even when registration-intended.** The Phase 2 rule (randomized and controlled) is kept as written. "Controlled" means a comparator arm, and randomizing between doses of one drug is not one. Operator's answer: "Probably keep the rule if this is outside scope - right- does that mean neither?", then "Fix the gap first". | Run 3 tie-break review, case 4 (Zentalis's DENALI): verdict N, not counted for either tie-breaker |
+
+**Rationale:**
+- **"Met" needs a bar.** A single-arm trial is judged against a success threshold that sponsors
+  rarely publish, so most of these readouts would end in the human queue.
+- **The catalyst is not lost.** If such a trial leads to an accelerated-approval filing, the FDA
+  decision is still an event.
+- **Accepted cost:** single-arm oncology readouts, a common catalyst class, are not in the ledger.
+
+### The gap the case found, and the fix (2026-11-01, $0)
+
+Nothing enforced the Phase 2 rule after extraction. Both cheap extractors reported DENALI, and the
+pilot ledger held two out-of-scope Agios events: tebapivat in LR-MDS (not randomized) and in sickle
+cell disease (59 patients). The fix is in `ledger/scope.py` and the extraction routing:
+
+- **Registry facts that fail the rule drop the statement** before any tie-break or operator time is
+  spent. Those facts are Phase 1/2, no randomization, or fewer than 100 patients and not called 2b.
+  Each drop is recorded as a closed `scope_check` queue item (`closed_by = auto:registry`) with the
+  registry facts that decided it.
+- **An unconfirmed control goes to the operator** (`scope_check`; keep records the event as "2b").
+  So does a plain "Phase 2" with no registry record.
+- **Arm types alone cannot decide control.** I fetched CT.gov arm types (free) for the 565
+  randomized Phase 2s the registry counts in scope. 73 have no comparator arm type, but at least 10
+  of those clearly have one, labelled "experimental" (for example, MORAb-202 versus investigator's
+  choice chemotherapy). So the registry only ever confirms a control. Intervention names (placebo,
+  sham, observation, standard of care) and comparisons in the title confirm 451 of the 565.
+- **Subsidiary lead sponsors** ("X, a wholly owned subsidiary of Y") now match Y. 40 trials in the
+  cached CT.gov pages were being dropped, DENALI and ASPENOVA among them. They join the registry at
+  the next CT.gov refresh.
+- **Each candidate is checked against its own trial.** One extractor's wrong NCT number cannot sink
+  the other's reading.
+- Migration `0003` adds `scope_check` to `review_queue.reason`.
+- The extraction prompt gets a DENALI-type example in its next revision, before the bootstrap.

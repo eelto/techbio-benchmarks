@@ -41,10 +41,44 @@ A partner's or licensee's statement about someone else's trial is not recorded u
 the company that runs the trial is in the universe, its own filings carry the event. If it is not,
 the event is out of scope. The rule changes no mapping, so the scoring version stays v1.1.
 
+A lead sponsor named on ClinicalTrials.gov as a wholly owned subsidiary counts as its parent. For
+example, Zentalis's DENALI (NCT05128825) is led by "K-Group, Beta, Inc., a wholly owned subsidiary of
+Zentalis Pharmaceuticals" and is filed under Zentalis.
+
 Example: Zai Lab's 2026-08-06 release (`src_01M69MRD539ZP3RD10VQ33M8R2`) gives the expected timing
 of topline results from ALKIVIA, argenx's Phase 2/3 trial of efgartigimod in myositis, for which Zai
 Lab holds Greater China rights. It is not a Zai Lab event, and argenx's own filings carry it. No
 event was created, so the example cites the source.
+
+### Phase 2: what counts as 2b (operator 2026-11-01, decision R.2)
+
+"Controlled" means the trial has a comparator arm: placebo, sham, an active drug, standard of care,
+or no treatment. Randomizing patients between doses or schedules of one drug is not a control. A
+single-arm or dose-comparison Phase 2 is out of scope even when the sponsor calls it registrational
+or pivotal. The reason is that "met" for such a trial needs a success threshold sponsors rarely
+publish, so most would end in the review queue. If such a trial leads to a filing, the FDA decision
+is still in scope as an `fda_decision` event.
+
+Each Phase 2 readout is checked against the registry before it reaches the ledger
+(`ledger/scope.py`):
+
+- **Dropped:** the registry shows Phase 1/2, no randomization, or fewer than 100 patients for a
+  trial that is not called 2b, pivotal, or registrational. The drop is recorded as a closed
+  `scope_check` item.
+- **Sent to the operator:** the trial passes those checks but the registry does not confirm a
+  control. A placebo, sham, or no-treatment arm, or a comparison in the title, confirms one. The registry cannot rule a control out, because
+  sponsors often label an active-comparator arm "experimental". A plain "Phase 2" with no registry
+  record is also sent.
+- **Kept on the extractors' reading:** a "2b" with no registry record.
+
+Examples:
+
+- Zentalis's 2026-05-05 release (`src_01M69MYHB9G51QSZ36V6NZP674`) gives the year-end readout timing
+  for DENALI Part 2. DENALI is registration-intended, but it randomizes patients between two doses of
+  azenosertib and has no control arm, so it is out. No event was created.
+- Agios's tebapivat studies (`src_01M69KQN51K0HMQFBC5MNKZJ1A`) are out too. The LR-MDS study
+  (NCT05490446) is not randomized, and the sickle cell study (NCT06924970) enrolls 59 patients and is
+  not called 2b. Both events were removed on the next run.
 
 ### Not events: exclusions (v1.1, operator 2026-10-30)
 
@@ -213,3 +247,4 @@ before the first events existed cite the registry record; the event ID is added 
 - `2026-10-30 · NCT06598631 · withdrawn citing another trial (NCT05592275) · rule T.3: not an event, exclusion linked to the cited trial · operator`
 - `2026-10-30 · NCT05074420 · stopped for failure to enroll (6 enrolled) · rule T.4: void, operational (confirmed) · operator`
 - `2026-11-01 · src_01M69MRD539ZP3RD10VQ33M8R2 (no event) · a partner's mention of its licensor's trial (Zai Lab on argenx's ALKIVIA) · rule R.1: filed under the trial's lead sponsor, never the partner · operator`
+- `2026-11-01 · src_01M69MYHB9G51QSZ36V6NZP674 (no event) · registration-intended single-drug Phase 2 with no control arm (Zentalis's DENALI, NCT05128825) · rule R.2: not 2b, out of scope; the FDA decision on any filing stays in scope · operator`

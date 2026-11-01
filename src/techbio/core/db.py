@@ -276,6 +276,7 @@ review_queue = Table(
     Column("reason", String, nullable=False),
     Column("payload", JSON, nullable=False),  # candidate values, quotes, confidences
     Column("status", String, nullable=False, default="open"),  # open | closed | skipped
+    # closed_by "auto:registry": a scope_check the registry decided (ledger/scope.py)
     Column("created_at", TS, nullable=False),
     Column("closed_at", TS),
     Column("closed_by", String),
@@ -293,6 +294,7 @@ review_queue = Table(
                 "outcome_confirmation",
                 "parse_failed",
                 "exclusion_link",
+                "scope_check",
             ),
         ),
         name="reason",

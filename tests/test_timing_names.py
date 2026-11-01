@@ -41,6 +41,12 @@ def test_company_matching():
     assert same_company("Capricor, Inc", "Capricor Therapeutics, Inc.")
     assert same_company("AstraZeneca Pharmaceuticals LP", "AstraZeneca PLC")
     assert not same_company("Vertex Pharmaceuticals", "Vertex Energy Inc")
+    # CT.gov lead sponsor of Zentalis's DENALI (NCT05128825), dropped by the sweep before
+    assert same_company(
+        "K-Group, Beta, Inc., a wholly owned subsidiary of Zentalis Pharmaceuticals, Inc",
+        "Zentalis Pharmaceuticals, Inc.",
+    )
+    assert not same_company("K-Group, Beta, Inc.", "Zentalis Pharmaceuticals, Inc.")
 
 
 def test_asset_matching():

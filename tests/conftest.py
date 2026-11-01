@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from datetime import UTC, datetime
@@ -12,6 +13,8 @@ os.environ.setdefault("SEC_USER_AGENT", "Test Runner test@example.com")
 
 from techbio.core import config  # noqa: E402
 from techbio.core.db import make_engine, metadata, now, sources, sponsors  # noqa: E402
+from techbio.core.llm import runner  # noqa: E402
+from techbio.core.llm.cache import LLMResponse  # noqa: E402
 
 config.settings.cache_clear()
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -76,3 +79,43 @@ def add_source(
             )
         )
     return source_id
+
+
+class Fake:
+    """Batch + sync provider whose answers depend on (model, source)."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.batches = {}
+        self.calls = []
+
+    def _resp(self, key, req, model_key):
+        self.calls.append((model_key, req))
+        body = self.answers(model_key, req)
+        if isinstance(body, Exception):  # the provider answered with an error
+            return LLMResponse(key, "", error=f"{type(body).__name__}: {body}")
+        return LLMResponse(key, json.dumps(body), tokens_in=1000, tokens_out=300)
+
+    def submit(self, items, model):
+        bid = f"b{len(self.batches)}"
+        self.batches[bid] = [self._resp(k, r, r.model_key) for k, r in items]
+        return bid
+
+    def collect(self, bid):
+        return self.batches[bid]
+
+    def call(self, key, req, model):
+        return self._resp(key, req, req.model_key)
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    holder = {}
+
+    def install(answers):
+        f = Fake(answers)
+        monkeypatch.setattr(runner, "_provider", lambda model: f)
+        holder["f"] = f
+        return f
+
+    return install

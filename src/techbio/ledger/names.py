@@ -77,7 +77,16 @@ def search_term(name: str) -> str:
     return " ".join(toks[:2]) if len(core[0]) < 5 else core[0]
 
 
+_SUBSIDIARY = re.compile(r"\bsubsidiary of\s+(.+)$", re.I)
+
+
 def same_company(a: str, b: str) -> bool:
+    """A CT.gov lead sponsor named as "X, a wholly owned subsidiary of Y" is Y."""
+    names = [[n, *(m.group(1) for m in [_SUBSIDIARY.search(n)] if m)] for n in (a, b)]
+    return any(_same_company(x, y) for x in names[0] for y in names[1])
+
+
+def _same_company(a: str, b: str) -> bool:
     ka, kb = company_key(a), company_key(b)
     if not ka or not kb:
         return False

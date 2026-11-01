@@ -5,6 +5,8 @@ exact supporting passages from the local copy of the source, with its link. The 
 B, types a value, links to an existing event, or skips. The decision is written as a new label
 version (`human:<reviewer>`) through the same apply path as automatic decisions. `exclusion_link`
 items (a withdrawn trial citing another trial without its NCT number) ask which trial it cites.
+`scope_check` items (a Phase 2 readout the registry cannot confirm meets the 2b rule) ask whether
+it counts as 2b: keeping it records the event as "2b".
 """
 
 from __future__ import annotations
@@ -128,6 +130,18 @@ def render(console: Console, item: dict[str, Any], src: dict[str, Any]) -> None:
                 "yes" if c["shared_intervention"] else "",
             )
         console.print(t)
+    if item["reason"] == "scope_check":
+        console.print(f"[yellow]{p.get('scope')}[/]")
+        reg = p.get("registry")
+        if reg:
+            console.print(
+                f"{reg['nct_id']}: {reg.get('brief_title')} · {'/'.join(reg.get('phases') or [])}"
+                f" · {reg.get('allocation')} · N={reg.get('enrollment')} · interventions: "
+                + ", ".join(i.get("name") or "" for i in reg.get("interventions") or [])
+            )
+        console.print(
+            "2b rule: randomized and controlled, and called 2b/pivotal/registrational or N >= 100"
+        )
     if item["reason"] == "event_link_ambiguous":
         t = Table(title="candidate events")
         for col in ("#", "event_id", "asset", "indication", "trial", "status"):
@@ -156,8 +170,9 @@ def decide(
     event_id: str | None = None,
     note: str | None = None,
 ) -> str | None:
-    """Apply an operator decision. choice: A | B | value | link | new | reject | skip, and for
-    `exclusion_link` items: link_trial (value = the cited NCT id) or reject (cites no trial)."""
+    """Apply an operator decision. choice: A | B | value | link | new | reject | skip, for
+    `exclusion_link` items: link_trial (value = the cited NCT id) or reject (cites no trial), and
+    for `scope_check` items: keep (it counts as 2b) or reject."""
     p = item["payload"]
     with engine.begin() as conn:
         if item["reason"] == "exclusion_link" and choice in ("link_trial", "reject"):
@@ -185,6 +200,8 @@ def decide(
             )
             return None
         st = Statement.from_json(p["statement"])
+        if choice == "keep":
+            st.phase = "2b"
         if choice in ("A", "B"):
             chosen = p["candidates"][choice]
             if chosen is None:
@@ -272,6 +289,12 @@ def interactive(
                     .strip()
                     .lower()
                 )
+            elif item["reason"] == "scope_check":
+                ans = (
+                    ask("[k]eep: counts as 2b · [r]eject: out of scope · [s]kip · [q]uit > ")
+                    .strip()
+                    .lower()
+                )
             elif item["reason"] == "event_link_ambiguous":
                 ans = (
                     ask("[#] link to candidate · [n]ew event · [r]eject · [s]kip · [q]uit > ")
@@ -311,6 +334,9 @@ def interactive(
                         value=json.loads(raw),
                         note=ask("note > ") or None,
                     )
+                    stats["decided"] += 1
+                elif ans == "k" and item["reason"] == "scope_check":
+                    decide(engine, item, "keep", reviewer, note=ask("note > ") or None)
                     stats["decided"] += 1
                 elif ans == "r":
                     decide(engine, item, "reject", reviewer)
