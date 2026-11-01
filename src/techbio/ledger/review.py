@@ -142,6 +142,9 @@ def render(console: Console, item: dict[str, Any], src: dict[str, Any]) -> None:
                 c["status"],
             )
         console.print(t)
+        for c in p["candidates"]:
+            if c.get("conflict"):
+                console.print(f"[yellow]{c['event_id']}: {c['conflict']}[/]")
 
 
 def decide(

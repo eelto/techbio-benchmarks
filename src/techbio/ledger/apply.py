@@ -24,7 +24,7 @@ from techbio.core.db import (
     trials,
 )
 from techbio.core.ids import new_id
-from techbio.ledger.names import asset_key, assets_overlap
+from techbio.ledger.names import asset_key, assets_overlap, indications_conflict
 from techbio.ledger.taxonomy import TAXONOMY_VERSION, explanation_category, score_outcome
 
 
@@ -112,6 +112,11 @@ def candidate_events(conn: Connection, sponsor_id: str, st: Statement) -> list[d
             continue
         if st.trial_name and r["trial_name"] and _norm(st.trial_name) != _norm(r["trial_name"]):
             continue
+        same_trial = (st.nct_id and st.nct_id == r["nct_id"]) or (
+            st.trial_name and r["trial_name"] and _norm(st.trial_name) == _norm(r["trial_name"])
+        )
+        if not same_trial and indications_conflict(st.indication, r["indication"]):
+            continue  # the same drug in another disease is another trial (EVO756: CSU, AD, migraine)
         out.append(dict(r))
     if len(out) > 1:
         # Prefer exact trial identity, then open events, then indication word overlap.
@@ -398,6 +403,40 @@ def resolve_event(
     return True
 
 
+def _brief(c: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: c[k] for k in ("event_id", "asset_name", "indication", "nct_id", "trial_name", "status")
+    }
+
+
+def _same_source_conflict(
+    conn: Connection, event_id: str, st: Statement, prov: Provenance
+) -> str | None:
+    """What this document already says about the event, when the new statement disagrees. Two
+    different statements from one document on one event are two trials matched to the same event:
+    the second must not be dropped (one promise per event per document) or supersede the first."""
+    if st.kind == "guidance" and st.window_start and st.window_end:
+        p = conn.execute(
+            select(promises.c.guided_start, promises.c.guided_end).where(
+                promises.c.event_id == event_id, promises.c.source_id == prov.source_id
+            )
+        ).first()
+        if p and (p.guided_start, p.guided_end) != (st.window_start, st.window_end):
+            return f"this document already gives this event the window {p.guided_start}..{p.guided_end}"
+    if st.kind in ("outcome", "discontinuation"):
+        new = st.result_category or ("discontinued" if st.kind == "discontinuation" else None)
+        cur = current_labels(conn, event_id).get("result_category")
+        if cur and new and cur[0] != new:
+            linked = conn.execute(
+                select(label_sources.c.label_id).where(
+                    label_sources.c.label_id == cur[1], label_sources.c.source_id == prov.source_id
+                )
+            ).first()
+            if linked:
+                return f"this document already gives this event the result {cur[0]}"
+    return None
+
+
 def apply_statement(
     conn: Connection, st: Statement, prov: Provenance, event_id: str | None = None
 ) -> ApplyResult:
@@ -405,25 +444,12 @@ def apply_statement(
     if event_id is None:
         cands = candidate_events(conn, prov.sponsor_id, st)
         if len(cands) > 1:
-            return ApplyResult(
-                None,
-                ambiguous=[
-                    {
-                        k: c[k]
-                        for k in (
-                            "event_id",
-                            "asset_name",
-                            "indication",
-                            "nct_id",
-                            "trial_name",
-                            "status",
-                        )
-                    }
-                    for c in cands
-                ],
-            )
+            return ApplyResult(None, ambiguous=[_brief(c) for c in cands])
         if cands:
             event_id = cands[0]["event_id"]
+            conflict = _same_source_conflict(conn, event_id, st, prov)
+            if conflict:
+                return ApplyResult(None, ambiguous=[{**_brief(cands[0]), "conflict": conflict}])
         else:
             event_id = create_event(conn, prov.sponsor_id, st)
             created = True

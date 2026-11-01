@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from techbio.ledger.names import assets_overlap, company_key, same_company
+from techbio.ledger.names import assets_overlap, company_key, indications_conflict, same_company
 from techbio.ledger.timing import parse_timing
 
 D = date(2026, 10, 1)
@@ -47,3 +47,41 @@ def test_asset_matching():
     assert assets_overlap(["VX-548"], ["suzetrigine", "VX548"])
     assert assets_overlap(["EXT-101 (zorbalimab)"], ["zorbalimab"])
     assert not assets_overlap(["EXT-101"], ["EXT-202"])
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        # Clearly different diseases: another trial of the same drug (pilot run 3, EVO756).
+        ("chronic spontaneous urticaria (CSU)", "moderate-to-severe AD patients"),
+        ("moderate-to-severe CSU", "migraine prophylaxis"),
+        ("lower-risk MDS", "sickle cell disease"),
+        ("platinum-resistant ovarian cancer", "pancreatic cancer"),
+        ("obesity", "type 2 diabetes"),
+        ("AD", "acute myeloid leukemia"),  # 'a…d' is not a spelling of AML
+    ],
+)
+def test_indications_that_conflict(a, b):
+    assert indications_conflict(a, b) and indications_conflict(b, a)
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("moderate-to-severe CSU", "chronic spontaneous urticaria (CSU)"),
+        ("atopic dermatitis", "moderate-to-severe AD patients"),
+        ("Dermatitis, Atopic", "AD"),  # CT.gov condition terms are often inverted
+        ("lower-risk MDS", "myelodysplastic syndromes"),
+        ("PROC", "platinum-resistant ovarian cancer"),
+        ("DLB", "dementia with Lewy bodies"),
+        ("HFpEF", "heart failure with preserved ejection fraction"),
+        ("T2D", "type 2 diabetes"),
+        ("early Alzheimer's disease", "Alzheimer's disease"),
+        # Too little to tell: never split on these.
+        ("advanced solid tumors", "ovarian cancer"),
+        (None, "ovarian cancer"),
+        ("", "CSU"),
+    ],
+)
+def test_indications_that_may_be_the_same_trial(a, b):
+    assert not indications_conflict(a, b) and not indications_conflict(b, a)
