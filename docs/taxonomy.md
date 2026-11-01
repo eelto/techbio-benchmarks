@@ -27,6 +27,25 @@ private issuers are included through 6-K. Ex-US trials of US-listed sponsors are
 PDUFA goal-date extensions (for example, 3 months for a major amendment) do **not** resolve an event.
 They update the expected date and are recorded as slip.
 
+### Attribution: whose event it is (operator 2026-11-01, decision R.1)
+
+One trial is one event, filed under the company that runs it:
+
+| event_type | Filed under |
+|---|---|
+| `readout` | the trial's lead sponsor on ClinicalTrials.gov |
+| `fda_decision`, `adcom` | the holder of the US application |
+| `discontinuation` | the company that owns the program |
+
+A partner's or licensee's statement about someone else's trial is not recorded under the partner. If
+the company that runs the trial is in the universe, its own filings carry the event. If it is not,
+the event is out of scope. The rule changes no mapping, so the scoring version stays v1.1.
+
+Example: Zai Lab's 2026-08-06 release (`src_01M69MRD539ZP3RD10VQ33M8R2`) gives the expected timing
+of topline results from ALKIVIA, argenx's Phase 2/3 trial of efgartigimod in myositis, for which Zai
+Lab holds Greater China rights. It is not a Zai Lab event, and argenx's own filings carry it. No
+event was created, so the example cites the source.
+
 ### Not events: exclusions (v1.1, operator 2026-10-30)
 
 A registry record that never had a chance to read out is not an event. It is recorded in
@@ -193,3 +212,4 @@ before the first events existed cite the registry record; the event ID is added 
 - `2026-10-30 · NCT05951205 · withdrawn, 0 enrolled · rule T.2: not an event, exclusion withdrawn_before_enrollment · operator`
 - `2026-10-30 · NCT06598631 · withdrawn citing another trial (NCT05592275) · rule T.3: not an event, exclusion linked to the cited trial · operator`
 - `2026-10-30 · NCT05074420 · stopped for failure to enroll (6 enrolled) · rule T.4: void, operational (confirmed) · operator`
+- `2026-11-01 · src_01M69MRD539ZP3RD10VQ33M8R2 (no event) · a partner's mention of its licensor's trial (Zai Lab on argenx's ALKIVIA) · rule R.1: filed under the trial's lead sponsor, never the partner · operator`

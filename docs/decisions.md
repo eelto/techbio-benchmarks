@@ -157,3 +157,34 @@ they don't collide with the first entry's A–E.
   - The pilot's ~10 Argon calls run synchronously: a one-off, not worth a batch adapter.
 - **Estimates:** the tie-break count is now rounded up. The dry-run gives the local tie-break time
   (about 9 h for the bootstrap, from the measured 80 tokens/s and 2,500 expected tokens per call).
+
+---
+
+## 2026-11-01 · Partner attribution (operator)
+
+### R. Whose event it is
+
+| # | Decision | Closes |
+|---|---|---|
+| R.1 | **One trial is one event, filed under the company that runs it.** Readouts go to the trial's lead sponsor on ClinicalTrials.gov, FDA decisions and AdComs to the holder of the US application, and discontinuations to the company that owns the program. A partner's or licensee's statement about someone else's trial is never recorded under the partner. If the company that runs the trial is not in the universe, the event is out of scope. Operator's answer: "Partner rule - A". | Run 3 tie-break review, case 3 (Zai Lab on argenx's ALKIVIA) |
+
+**Rationale:**
+- **No double counting.** The same readout filed under both partners would count twice in the base
+  rates and in the arena.
+- **Promises belong to whoever sets the timeline.** Slip tracking asks whether a company keeps its
+  own guidance, and a licensee does not control its licensor's trial.
+- **Mechanical.** The lead sponsor and the application holder come from primary sources, so the rule
+  adds nothing to the review queue.
+- **Accepted cost:** a US-listed licensee of a drug whose trial is run by an unlisted licensor loses
+  that readout. Counting how often this happens needs the extractors to report partner mentions
+  separately, which is proposed with the next extraction-prompt revision.
+
+### How it is implemented
+
+- `docs/taxonomy.md` §1 ("Attribution") and an adjudication-log entry.
+- The extraction instructions already ask only for "this sponsor's own programs". Explicit partner
+  wording goes into the next revision of the extraction prompt, before the bootstrap, together with
+  the trial-start and boilerplate fixes. That revision changes the prompt hash, so the pilot
+  extractors re-run, with an estimate first.
+- The scoring version stays v1.1: the rule decides which company an event is filed under, not how any
+  outcome is scored.
