@@ -25,11 +25,25 @@ models:
     reasoning: {effort: low}
     expected_output_tokens: 1200
   tiebreak:
-    # Ornith 1.5 122B, open weights (NVFP4), on the operator's local Ollama 0.40.5. Operator
-    # decision 2026-10-31 (decisions.md P.1). Free, and excerpts never leave the machine. No batch
-    # path: one call at a time. Pinned by the manifest digest Ollama reports in /api/tags; the
-    # provider refuses to run if the server has other weights under this tag.
+    # Gemini 4 Argon, a third vendor. Operator decision 2026-11-02 (decisions.md P.3), P.2's
+    # fallback after the pilot tie-break review. Paid tier only: Google's unpaid tier may use
+    # inputs for training. Synchronous until our Google client has a batch path (Q-G2), planned
+    # before the bootstrap. Settings are unchanged from its pilot runs, so their answers are cached.
     role: tiebreak
+    provider: google
+    model_version: gemini-4-argon
+    # 2.00/10.00 until 2026-12-01, then 4.00/20.00. Estimates use the higher price.
+    price: {input: 4.00, cached_input: 0.40, output: 20.00}
+    batch_discount: 1.0
+    reasoning: {thinking_level: MEDIUM}
+    expected_output_tokens: 2500
+  tiebreak_reference:
+    # Pilot only (`ledger extract --compare-tiebreak`): the same disputes, as a free check on the
+    # tie-breaker. Its choices are reported and never applied. Ornith 1.5 122B, open weights
+    # (NVFP4), on the operator's local Ollama 0.40.5: the tie-breaker from 2026-10-31 to 2026-11-02
+    # (P.1). No batch path: one call at a time. Pinned by the manifest digest Ollama reports in
+    # /api/tags; the provider refuses to run if the server has other weights under this tag.
+    role: tiebreak_reference
     provider: ollama
     model_version: "ornith-1.5:122b-nvfp4@sha256:f0df8c3e9efc1c5a583b03d4885a55a9695fef5a96e5eebca1e6abeb65ae3e0a"
     endpoint: http://127.0.0.1:11435
@@ -40,18 +54,7 @@ models:
     context_tokens: 32768
     max_output_tokens: 8000     # an answer that hits the cap is an error and goes to the queue
     expected_output_tokens: 2500
-    output_tokens_per_s: 80     # measured 2026-10-31 (M5 Max); for the dry-run's time estimate
-  tiebreak_reference:
-    # Pilot only (`ledger extract --compare-tiebreak`): the same disputes, to check the local
-    # tie-breaker. Its choices are reported and never applied. Synchronous: about 10 calls (P.2).
-    role: tiebreak_reference
-    provider: google
-    model_version: gemini-4-argon
-    # 2.00/10.00 until 2026-12-01, then 4.00/20.00. Estimates use the higher price.
-    price: {input: 4.00, cached_input: 0.40, output: 20.00}
-    batch_discount: 1.0
-    reasoning: {thinking_level: MEDIUM}
-    expected_output_tokens: 2500
+    output_tokens_per_s: 80     # measured 2026-10-31 (M5 Max)
   # --- arena + harness flagships (enabled at their milestones) ---
   astra:
     role: flagship

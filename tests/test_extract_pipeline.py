@@ -18,7 +18,7 @@ from techbio.core.db import (
     sources,
 )
 from techbio.core.llm import runner
-from techbio.ledger.extract import run_extraction
+from techbio.ledger.extract import estimate_job, pending_docs, run_extraction, run_prefilter
 from techbio.ledger.quotes import drop_sample
 from techbio.ledger.report import summary
 from techbio.ledger.review import decide, open_items, queue_size
@@ -216,7 +216,7 @@ def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake
             (r.provider, r.batch_id is not None)
             for r in c.execute(select(completions.c.provider, completions.c.batch_id))
         }
-    assert modes == {("anthropic", True), ("openai", True), ("ollama", False)}
+    assert modes == {("anthropic", True), ("openai", True), ("google", False)}
 
     q = summary(engine)["quote_checks"]
     assert (q["checked"], q["dropped"], q["fuzzy_kept"]) == (5, 1, 1)
@@ -257,7 +257,7 @@ def test_pilot_compares_tiebreak_with_reference_but_labels_come_from_tiebreak(
     tb = [r for m, r in f.calls if m == "tiebreak"]
     ref = [r for m, r in f.calls if m == "tiebreak_reference"]
     assert len(tb) == len(ref) == 1 and ref[0].user == tb[0].user and ref[0].system == tb[0].system
-    # The local tie-breaker (cheap) runs before the reference.
+    # The tie-breaker runs before the reference.
     order = [m for m, _ in f.calls if m.startswith("tiebreak")]
     assert order == ["tiebreak", "tiebreak_reference"]
     with engine.connect() as c:
@@ -269,32 +269,38 @@ def test_pilot_compares_tiebreak_with_reference_but_labels_come_from_tiebreak(
         )
         tb_models = set(
             c.execute(
-                select(completions.c.model_version).where(completions.c.provider == "ollama")
+                select(completions.c.model_version).where(completions.c.provider == "google")
             ).scalars()
         )
-    # The reference never decides a label: A's window stands, adjudicated by the local model.
+    # The reference never decides a label: A's window stands, adjudicated by the tie-breaker.
     assert (str(p["guided_start"]), str(p["guided_end"])) == ("2027-05-01", "2027-08-31")
     assert p["reviewer_kind"] == "model-adjudicated"
     assert tb_models == {model_cfg("tiebreak")["model_version"]}
 
 
-def test_dry_run_prices_the_reference_only_when_comparing(engine, sponsor, fake, tmp_path):
+def test_dry_run_counts_the_reference_only_when_comparing(engine, sponsor, fake, tmp_path):
     f = fake(answers)
     add_source(
         engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
     )
-    plain = run_extraction(engine, execute=False)
-    compared = run_extraction(engine, execute=False, compare_tiebreak=True)
-    assert compared["est_usd"] > plain["est_usd"] > 0 and f.calls == []
+    run_prefilter(engine)
+    docs = pending_docs(engine, None, None)
+    plain = estimate_job(engine, docs, "ledger_extract")
+    compared = estimate_job(engine, docs, "ledger_extract", compare_tiebreak=True)
+    assert [i.model_key for i in compared.items] == [i.model_key for i in plain.items] + [
+        "tiebreak_reference"
+    ]
+    # The reference is the free local model since P.3: comparing adds calls, not dollars.
+    assert compared.total_usd == plain.total_usd > 0 and f.calls == []
 
 
-def test_tiebreak_server_is_checked_before_any_paid_call(
+def test_local_reference_server_is_checked_before_any_paid_call(
     engine, sponsor, fake, monkeypatch, tmp_path
 ):
     f = fake(answers)
 
     def provider(model):
-        if model["key"] == "tiebreak":
+        if model["key"] == "tiebreak_reference":
             raise RuntimeError("Ollama is not reachable")
         return f
 
@@ -303,7 +309,7 @@ def test_tiebreak_server_is_checked_before_any_paid_call(
         engine, sponsor, (FIX / "press_release_synthetic.html").read_text(), tmp_path=tmp_path
     )
     with pytest.raises(RuntimeError, match="not reachable"):
-        run_extraction(engine, execute=True)
+        run_extraction(engine, execute=True, compare_tiebreak=True)
     assert f.calls == []
     with engine.connect() as c:
         assert c.execute(select(sources.c.extract_status)).scalar_one() == "none"
@@ -348,7 +354,7 @@ def test_reference_errors_are_reported(engine, sponsor, fake, tmp_path):
     out = run_extraction(engine, execute=True, compare_tiebreak=True)
     assert out["errors"]["tiebreak_reference"]["n"] == 1
     assert out["tiebreak_comparison"]["disagreements"][0]["reference"] is None
-    assert out["accepted"] == 2  # the local tie-break still applies
+    assert out["accepted"] == 2  # the tie-break still applies
 
 
 def test_optional_enums_avoid_type_lists():

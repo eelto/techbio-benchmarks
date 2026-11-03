@@ -37,8 +37,8 @@ provider's own model-overview page. Price plays no part.
 | mid-tier, `enabled: false` | Anthropic | `claude-opus-5-5` | 4 · 20 | 50% | Enters later on its own model-day, for the cost-per-point chart. |
 | extractor A | Anthropic | `claude-haiku-5-5` | 0.10 · 0.50 | 50% | Its tokenizer counts about 30% more tokens. |
 | extractor B | OpenAI | `gpt-6-luna` | 0.10 · 0.50 | 50% | |
-| tie-break | local (Ollama) | `ornith-1.5:122b-nvfp4`, pinned by digest | 0 · 0 | none (one call at a time) | Open weights on the operator's Mac Studio; independent of both extractors. Replaced Argon 2026-10-31 (P.1). |
-| tie-break reference, pilot only | Google | `gemini-4-argon` | 4 · 20 from 2026-12-01 (2 · 10 until then) | none | Checks the local tie-breaker on the pilot's disputes; never applied (P.2). |
+| tie-break | Google | `gemini-4-argon` | 4 · 20 from 2026-12-01 (2 · 10 until then) | none yet (our Google client has no batch path, Q-G2) | A third vendor, independent of both extractors. Back from Ornith 2026-11-02 after the pilot review (P.3). |
+| tie-break reference, pilot only | local (Ollama) | `ornith-1.5:122b-nvfp4`, pinned by digest | 0 · 0 | none (one call at a time) | The tie-breaker from 2026-10-31 to 2026-11-02 (P.1); now a free check on the pilot's disputes, never applied. |
 
 \*Inspect's Google batch mode doesn't support thinking, so Gemini harness runs are synchronous at full
 price unless we write our own Gemini batch client (Q-G2). The arena already uses our own client.
@@ -164,8 +164,8 @@ counts the actual documents left after the free prefilter.
 
 **Assumptions:**
 - Extraction: two cheap extractors, about 3k tokens in and 1.2k out per document.
-- Tie-break: about 20% of documents need one, on Argon. (Since 2026-10-31 it runs locally at $0; see
-  below.)
+- Tie-break: about 20% of documents need one, on Argon. (Local at $0 from 2026-10-31, back on Argon
+  from 2026-11-02; see below.)
 - Prefilter: free.
 
 | Job | Documents | Est. |
@@ -181,6 +181,13 @@ The tie-break model accounts for about 80% of ledger cost.
 for the 5,353 documents that pass the prefilter fell from $75.28 to **$5.58**, plus about 9 hours
 of local tie-breaks. The 50-document pilot is $0.68, of which $0.63 is the one-off Argon
 comparison.
+
+**Update 2026-11-02 (P.3):** the tie-break is back on Argon after the pilot review. The pilot
+measured $0.023 per Argon tie-break at the December price. That puts the bootstrap at about **$79**
+($30–$138) for tie-breaks plus **$2.65** for the extractors, above the $75 cap. Google bills about
+half that before 2026-12-01, and a Gemini batch path (Q-G2) would roughly halve it again. The scope
+check and the next prompt revision cut the disputes that reach a tie-break, so the number is
+re-measured on the pilot before the bootstrap go-ahead.
 
 ---
 

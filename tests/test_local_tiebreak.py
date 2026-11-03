@@ -1,4 +1,5 @@
-"""The local tie-breaker (Ollama), operator decision 2026-10-31. Ollama's HTTP API is mocked: no
+"""The local model (Ollama): the tie-breaker under P.1, the free pilot reference since P.3
+(2026-11-02). Ollama's HTTP API is mocked: no
 network, no model."""
 
 import json
@@ -14,13 +15,15 @@ from techbio.core.llm.cache import LLMRequest, cache_key
 from techbio.core.llm.providers import OllamaSync
 from techbio.ledger.extract import TB_SCHEMA
 
-M = model_cfg("tiebreak")
+M = model_cfg("tiebreak_reference")
 TAG, DIGEST = M["model_version"].split("@sha256:")
 URL = M["endpoint"]
 
 
 def req(max_out: int = 8000) -> LLMRequest:
-    return LLMRequest("tiebreak", "system text", "user text", TB_SCHEMA, "tiebreak", max_out)
+    return LLMRequest(
+        "tiebreak_reference", "system text", "user text", TB_SCHEMA, "tiebreak", max_out
+    )
 
 
 def tags(digest: str = DIGEST, name: str = TAG) -> dict:
@@ -38,7 +41,7 @@ def reply(content: str, done_reason: str = "stop") -> dict:
     }
 
 
-def test_tiebreak_is_local_pinned_free_and_thinking():
+def test_reference_is_local_pinned_free_and_thinking():
     assert M["provider"] == "ollama"
     # The exact weights: a tag alone can be re-pointed by a pull.
     assert re.fullmatch(r"[\w.\-]+:[\w.\-]+@sha256:[0-9a-f]{64}", M["model_version"])
@@ -47,7 +50,10 @@ def test_tiebreak_is_local_pinned_free_and_thinking():
     # Thinking off returned "neither" or nothing on every probe (2026-10-31).
     assert M["reasoning"] == {"think": True}
     assert isinstance(M["seed"], int)
-    assert model_cfg("tiebreak_reference")["provider"] == "google"
+    # The tie-breaker is a third vendor, independent of both extractors (P.3).
+    tb = model_cfg("tiebreak")
+    assert tb["provider"] == "google" and not runner.is_batch(tb)
+    assert tb["provider"] not in {model_cfg(k)["provider"] for k in ("extractor_a", "extractor_b")}
 
 
 def test_weights_and_seed_are_in_the_cache_key():

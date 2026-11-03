@@ -129,6 +129,8 @@ they don't collide with the first entry's A–E.
 | P.1 | **The ledger tie-breaker is Ornith 1.5 122B, run locally,** replacing Gemini 4 Argon. It is an open-weight model (NVFP4) on the operator's Mac Studio, served by Ollama. Rationale: Argon tie-breaks were $69.70 of the $75.28 bootstrap estimate. Locally they cost $0, and excerpts never leave the machine. | — |
 | P.2 | **The extraction pilot checks it against Argon.** Argon answers the same disputes. Its choices are reported, never applied. If they disagree too often, the bootstrap stays on Argon. | — |
 
+P.1 was superseded by P.3 on 2026-11-02.
+
 ### Measured before deciding (2026-10-31, local, $0)
 
 - **Thinking off:** "neither" or no answer on all three synthetic tie-breaks, and zero events found in
@@ -224,3 +226,70 @@ cell disease (59 patients). The fix is in `ledger/scope.py` and the extraction r
   the other's reading.
 - Migration `0003` adds `scope_check` to `review_queue.reason`.
 - The extraction prompt gets a DENALI-type example in its next revision, before the bootstrap.
+
+---
+
+## 2026-11-02 · Ledger tie-breaker, after the pilot review (operator)
+
+| # | Decision | Closes |
+|---|---|---|
+| P.3 | **The ledger tie-breaker is Gemini 4 Argon. Ornith becomes the free pilot reference.** This is P.2's fallback. Operator's answer: "Yes, switch to Gemini". | Run 3 tie-break review |
+
+**The review:** pilot run 3 had 7 tie-breaks where Ornith and Argon disagreed (9 fields, 5
+documents). The operator ruled cases 1–4 and approved Claude's verdict on case 5. Then the operator
+asked Claude to decide the rest ("ok i think this approach is not quite working for me. i dont like
+being the tie breaker. can you be the decider?"), and Claude (Opus 5.5) decided cases 6 and 7.
+
+| Case | Document | Right | Why |
+|---|---|---|---|
+| 1 | CervoMed, neflamapimod | Argon | A planned Phase 3 start, not a readout |
+| 2 | Evommune, EVO301 | Argon | A planned Phase 2b start, not a readout |
+| 3 | Zai Lab, efgartigimod | Ornith | Partner's trial, filed under argenx (R.1) |
+| 4 | Zentalis, DENALI | not counted | Out of scope under R.2; neither could reject it |
+| 5 | Agios, mismatched tebapivat pair | Ornith | "Neither": two trials paired by our matching bug |
+| 6 | Agios, tebapivat in LR-MDS | Argon | Open-label, no control: fails the Phase 2 rule |
+| 7 | Agios, tebapivat in sickle cell | Argon | Plain Phase 2, not called 2b, 59 patients |
+
+**Rationale:**
+- **Argon 4, Ornith 2.** Argon's four wins are all one failure: Ornith keeping, or hedging on, a
+  statement that should not be in the ledger. A false event is the costlier mistake in a public
+  ledger.
+- **Ornith's two wins do not carry forward.** Case 3 is now a written rule (R.1). Case 5 came from
+  our matching bug, and the scope check now drops that pair before any tie-break.
+- **Reliability.** Ornith hit its output cap on DENALI in all four runs, and each failure goes to
+  the operator's queue.
+- **Caveat:** six counted cases is thin evidence.
+- **Not chosen on cost or credits (S10).** Argon costs money and Ornith is free.
+
+**Cost and how it is run:**
+- With Argon, the bootstrap tie-breaks are estimated at about $79 ($30–$138) at the configured
+  December price, plus $2.65 for the extractors. That is above the $75 cap. Google bills about half
+  that price before 2026-12-01.
+- The scope check and the next prompt revision cut the disputes that reach a tie-break. The cost is
+  re-measured on the pilot after that revision and settled in the bootstrap go-ahead.
+- Argon runs synchronously until our Google client has a batch path (Q-G2). A batch path would
+  roughly halve the cost and is planned before the bootstrap.
+- `config/models.yaml` keeps the settings Argon had as the pilot reference, so its run 3 answers are
+  cached and re-applying them costs nothing.
+
+### The R.1 gap the replay found, and the fix (2026-11-02, $0)
+
+A $0 replay of the pilot with Argon choosing filed Zai Lab's mention of argenx's ALKIVIA as a Zai
+Lab event. Nothing in the code enforced R.1; Ornith had happened to drop it. The operator approved
+fixing it before applying P.3 ("Yes, fix it first"). The fix applies R.1 and changes no rule; the
+details below are Claude's.
+
+- **The registry decides.** A readout whose trial (by NCT number, else by acronym) is led by
+  another company in the universe is dropped before any tie-break. The drop is a closed
+  `scope_check` item on `sponsor_id`, with the registry facts and the lead sponsor's name.
+- **The trial must test the statement's asset** (its interventions or title name it). 46 acronyms
+  belong to more than one sponsor. In the replay, Roivant's brepocitinib VALOR shares its acronym
+  with Pfizer's Lyme vaccine trial, and the asset test keeps Roivant's event. A wrong NCT number is
+  held to the same test. Titles count because ALKIVIA lists efgartigimod only as "EFG PH20 SC".
+- **The sponsor's own trial of that acronym comes first.** With no registry record the extractors'
+  reading stands.
+- **Replay** (scratch copy, cached answers, 0 paid calls): the ALKIVIA event is the only change. 20
+  events and 20 open queue items.
+- **Not covered:** a partner's mention of a trial whose lead sponsor is outside the universe, or not
+  in the registry yet (the subsidiary-led trials before the next CT.gov refresh). The next
+  extraction-prompt revision states R.1 to the extractors as well.

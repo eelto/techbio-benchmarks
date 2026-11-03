@@ -50,6 +50,13 @@ of topline results from ALKIVIA, argenx's Phase 2/3 trial of efgartigimod in myo
 Lab holds Greater China rights. It is not a Zai Lab event, and argenx's own filings carry it. No
 event was created, so the example cites the source.
 
+Each readout is checked against the registry before it reaches the ledger (`ledger/scope.py`, from
+2026-11-02). The trial is found by NCT number or, failing that, by acronym; the sponsor's own trial
+of that acronym comes first. If another company in the universe leads it and it tests the
+statement's asset (named in its interventions or title), the statement is dropped and recorded as a
+closed `scope_check` item on `sponsor_id`. Otherwise, including when there is no registry record,
+the extractors' reading stands.
+
 ### Phase 2: what counts as 2b (operator 2026-11-01, decision R.2)
 
 "Controlled" means the trial has a comparator arm: placebo, sham, an active drug, standard of care,

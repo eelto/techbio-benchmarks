@@ -38,7 +38,7 @@ from techbio.ledger import prefilter
 from techbio.ledger.apply import Provenance, Statement, apply_statement
 from techbio.ledger.names import assets_overlap
 from techbio.ledger.quotes import QuoteMatch, match_quote, record_check
-from techbio.ledger.scope import CHECKED, facts, readout_scope, registry_trial
+from techbio.ledger.scope import attribution, facts, readout_scope, registry_trial
 from techbio.ledger.sources.ctgov import parse_study, stop_document
 from techbio.ledger.taxonomy import (
     ALL_RESULTS,
@@ -476,31 +476,37 @@ def _queue(
     )
 
 
-def _scope(conn, doc: Doc, sts: list[Statement]) -> tuple[str, str, dict[str, Any] | None]:
-    """The 2b rule (ledger/scope.py). Each candidate is checked against its own trial and the most
-    lenient verdict stands, so before routing a pair is dropped only when the registry rules out
-    every candidate: one candidate's wrong NCT number cannot sink the other."""
+Verdict = tuple[str, str, dict[str, Any] | None, str]  # (in | ask | out, why, trial, field)
+
+
+def _scope(conn, doc: Doc, sts: list[Statement]) -> Verdict:
+    """Attribution (R.1), then the 2b rule (ledger/scope.py). Each candidate is checked against its
+    own trial and the most lenient verdict stands, so before routing a pair is dropped only when the
+    registry rules out every candidate: one candidate's wrong NCT number cannot sink the other."""
     verdicts = [_scope_one(conn, doc, s) for s in sts]
-    return min(verdicts, key=lambda v: LENIENCY.index(v[0]), default=("in", "", None))
+    return min(verdicts, key=lambda v: LENIENCY.index(v[0]), default=("in", "", None, "phase"))
 
 
 LENIENCY = ("in", "ask", "out")
 
 
-def _scope_one(conn, doc: Doc, st: Statement) -> tuple[str, str, dict[str, Any] | None]:
-    if st.event_type != "readout" or st.phase not in CHECKED:
-        return "in", "", None
+def _scope_one(conn, doc: Doc, st: Statement) -> Verdict:
+    if st.event_type != "readout":
+        return "in", "", None, "phase"
+    sponsor = doc.src["sponsor_id"]
     nct = st.nct_id or (doc.src["meta"].get("nct_id") if doc.src["type"] == "ctgov" else None)
-    t = registry_trial(conn, doc.src["sponsor_id"], nct, st.trial_name)
-    return (*readout_scope(st.phase, t), t)
+    t = registry_trial(conn, sponsor, nct, st.trial_name, st.names())
+    verdict, why = attribution(sponsor, st.names(), t)
+    if verdict == "out":
+        return verdict, why, t, "sponsor_id"
+    return (*readout_scope(st.phase, t), t, "phase")
 
 
-def _out_of_scope(
-    conn, doc: Doc, st: Statement, why: str, t: dict | None, stats: dict[str, int]
-) -> None:
+def _out_of_scope(conn, doc: Doc, st: Statement, verdict: Verdict, stats: dict[str, int]) -> None:
     """A readout the registry rules out never reaches the ledger; the drop stays on record."""
+    _, why, t, field = verdict
     payload = {"statement": st.to_json(), "scope": why, "registry": facts(t)}
-    _queue(conn, doc, "scope_check", "phase", payload, closed_by="auto:registry")
+    _queue(conn, doc, "scope_check", field, payload, closed_by="auto:registry")
     stats["out_of_scope"] += 1
 
 
@@ -512,9 +518,10 @@ def _accept(
     )
     if doc.src["type"] == "ctgov" and not st.nct_id:
         st.nct_id = doc.src["meta"].get("nct_id")  # the registry record is that trial
-    verdict, why, t = _scope(conn, doc, [st])
+    v = _scope(conn, doc, [st])
+    verdict, why, t, field = v
     if verdict == "out":
-        _out_of_scope(conn, doc, st, why, t, stats)
+        _out_of_scope(conn, doc, st, v, stats)
         return
     if verdict == "ask":
         payload = {
@@ -524,7 +531,7 @@ def _accept(
             "scope": why,
             "registry": facts(t),
         }
-        _queue(conn, doc, "scope_check", "phase", payload)
+        _queue(conn, doc, "scope_check", field, payload)
         stats["queued"] += 1
         return
     res = apply_statement(conn, st, prov)
@@ -651,9 +658,9 @@ def run_extraction(
                 stats["quote_dropped"] += sum(1 for c in ca + cb if not c.quote_ok)
                 stats["quote_fuzzy"] += sum(1 for c in ca + cb if c.qm.method == "fuzzy")
                 for a, b in pair([c for c in ca if c.quote_ok], [c for c in cb if c.quote_ok]):
-                    verdict, why, t = _scope(conn, d, [c.st for c in (a, b) if c])
-                    if verdict == "out":  # before any tie-break or operator time is spent
-                        _out_of_scope(conn, d, (a or b).st, why, t, stats)
+                    v = _scope(conn, d, [c.st for c in (a, b) if c])
+                    if v[0] == "out":  # before any tie-break or operator time is spent
+                        _out_of_scope(conn, d, (a or b).st, v, stats)
                         continue
                     if a and b:
                         disputed = disputed_fields(a.st, b.st)

@@ -10,6 +10,13 @@ sponsors often label an active-comparator arm "experimental" (2026-11-01: at lea
 randomized Phase 2s with no comparator arm type had one). So a registry fact that fails the rule
 drops the statement, an unconfirmed control goes to the operator, and where there is no registry
 record a plain "Phase 2" goes to the operator and a "2b" keeps the extractors' reading.
+
+Before the 2b rule, every readout is checked for attribution (decision R.1): it is filed under the
+trial's lead sponsor, so a partner's mention of another universe company's trial is dropped. The
+2026-11-02 replay found one (Zai Lab on argenx's ALKIVIA). Another company's trial counts only if
+it tests the statement's asset, so a wrong NCT number or a shared acronym (46 acronyms belong to
+more than one sponsor) cannot drop a sponsor's own readout. With no registry record the extractors'
+reading stands.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from typing import Any
 from sqlalchemy import Connection, func, select
 
 from techbio.core.db import trials
+from techbio.ledger.names import assets_overlap
 from techbio.ledger.sources.ctgov import TWO_B
 
 CHECKED = (None, "2", "2b")  # readout phases the rule applies to; "2/3" and "3" are always in
@@ -32,13 +40,26 @@ _COMPARISON = re.compile(
     r"standard of care|watchful waiting|placebo",
     re.I,
 )
-REGISTRY_FACTS = ("nct_id", "brief_title", "phases", "allocation", "enrollment", "interventions")
+REGISTRY_FACTS = (
+    "nct_id",
+    "lead_sponsor_name",
+    "brief_title",
+    "phases",
+    "allocation",
+    "enrollment",
+    "interventions",
+)
 
 
 def registry_trial(
-    conn: Connection, sponsor_id: str, nct_id: str | None, trial_name: str | None
+    conn: Connection,
+    sponsor_id: str,
+    nct_id: str | None,
+    trial_name: str | None,
+    assets: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
-    """The registry record by NCT number, else by the sponsor's trial acronym if exactly one."""
+    """The registry record by NCT number, else by the sponsor's trial acronym if exactly one, else
+    by the acronym of the one other company's trial that tests one of `assets`."""
     if nct_id:
         row = conn.execute(select(trials).where(trials.c.nct_id == nct_id)).mappings().first()
         if row:
@@ -46,17 +67,37 @@ def registry_trial(
     if trial_name:
         rows = (
             conn.execute(
-                select(trials).where(
-                    trials.c.sponsor_id == sponsor_id,
-                    func.lower(trials.c.acronym) == trial_name.strip().lower(),
-                )
+                select(trials).where(func.lower(trials.c.acronym) == trial_name.strip().lower())
             )
             .mappings()
             .all()
         )
-        if len(rows) == 1:
-            return dict(rows[0])
+        own = [r for r in rows if r["sponsor_id"] == sponsor_id]
+        if own:
+            return dict(own[0]) if len(own) == 1 else None
+        others = [r for r in rows if tests_asset(r, assets)]
+        if len(others) == 1:
+            return dict(others[0])
     return None
+
+
+def tests_asset(t: dict[str, Any], assets: list[str] | tuple[str, ...]) -> bool:
+    """The trial's interventions or title name one of the asset's names. Titles count because
+    interventions are often abbreviated (ALKIVIA lists efgartigimod as "EFG PH20 SC")."""
+    names = [i.get("name") or "" for i in t.get("interventions") or []]
+    return bool(assets) and assets_overlap(list(assets), [*names, t.get("brief_title") or ""])
+
+
+def attribution(
+    sponsor_id: str, assets: list[str] | tuple[str, ...], t: dict[str, Any] | None
+) -> tuple[str, str]:
+    """("in" | "out", why) under R.1: "out" when another company in the universe leads the trial."""
+    if t is None or t.get("sponsor_id") in (None, sponsor_id) or not tests_asset(t, assets):
+        return "in", ""
+    return "out", (
+        f"registry: {t['nct_id']} is led by {t.get('lead_sponsor_name')}, another company in the "
+        "universe; a readout is filed under its lead sponsor (R.1)"
+    )
 
 
 def controlled(t: dict[str, Any]) -> bool:
