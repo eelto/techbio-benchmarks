@@ -7,7 +7,7 @@ as "EFG PH20 SC")."""
 import pytest
 from sqlalchemy import func, select
 
-from techbio.core.db import events, now, review_queue, sponsors, trials
+from techbio.core.db import events, extractions, now, review_queue, sponsors, trials
 from techbio.ledger.extract import run_extraction
 from techbio.ledger.review import queue_size
 from techbio.ledger.scope import attribution, registry_trial
@@ -187,3 +187,77 @@ def test_a_wrong_nct_number_that_does_not_test_the_asset_does_not_drop_it(
     add_trial(engine, LICENSOR, brief_title="A Study of LCN-7 in Myositis", interventions=[])
     out = run_extraction(engine, execute=True)
     assert (out["accepted"], out["out_of_scope"]) == (1, 0)
+
+
+Q_OTHER = "Our licensee Private Pharma GmbH expects to report topline data from its Phase 3 trial of EXT-505 in gout in 2027."
+DOC_MENTIONS = f"<html><body><p>{Q}</p><p>{Q_OTHER}</p></body></html>"
+
+
+def mention(**kw):
+    base = {
+        "asset_name": "EXT-404",
+        "event_type": "readout",
+        "trial_name": "SPARK",
+        "nct_id": None,
+        "run_by": "Licensor Bio",
+        "quote": Q,
+    }
+    return {**base, **kw}
+
+
+def test_partner_mentions_are_counted_and_kept_but_never_become_events(
+    engine, licensor, fake, tmp_path
+):
+    # Prompt v2 asks for partner mentions separately (decision R.1, "accepted cost"): how often a
+    # licensee's release gives a readout whose trial is run outside the universe, and so is lost.
+    def answers(model_key, req):
+        assert model_key.startswith("extractor"), "a partner mention is never tie-broken"
+        found = [mention()]
+        if model_key == "extractor_a":
+            found += [
+                mention(
+                    asset_name="EXT-505",
+                    trial_name=None,
+                    run_by="Private Pharma GmbH",
+                    quote=Q_OTHER,
+                ),
+                mention(asset_name="EXT-606", run_by=None, quote="EXT-606 data expected in 2027."),
+            ]
+        return {"statements": [], "partner_mentions": found}
+
+    fake(answers)
+    add_source(engine, PARTNER, DOC_MENTIONS, tmp_path=tmp_path)
+    out = run_extraction(engine, execute=True)
+    # The third mention's quote is not in the document, so it is not counted.
+    assert out["partner_mentions"] == {
+        "extractor_a": {"n": 2, "in_universe": 1, "outside_universe": 1, "run_by_not_stated": 0},
+        "extractor_b": {"n": 1, "in_universe": 1, "outside_universe": 0, "run_by_not_stated": 0},
+    }
+    assert (out["accepted"], out["queued"], out["tiebreaks"]) == (0, 0, 0)
+    assert count_events(engine) == 0 and queue_size(engine)["total"] == 0
+    with engine.connect() as c:
+        rows = (
+            c.execute(select(extractions).where(extractions.c.field == "partner_mention"))
+            .mappings()
+            .all()
+        )
+    assert sorted((r["model_key"], r["candidate_key"], r["quote_verified"]) for r in rows) == [
+        ("extractor_a", "partner|EXT-404", True),
+        ("extractor_a", "partner|EXT-505", True),
+        ("extractor_a", "partner|EXT-606", False),
+        ("extractor_b", "partner|EXT-404", True),
+    ]
+    assert {r["value"]["run_by"] for r in rows} == {"Licensor Bio", "Private Pharma GmbH", None}
+
+
+def test_schema_and_prompt_name_the_same_fields():
+    from techbio.ledger.extract import PARTNER_SCHEMA, SCHEMA, STATEMENT_SCHEMA, system_prompt
+
+    assert SCHEMA["required"] == ["statements", "partner_mentions"]
+    prompt = system_prompt()
+    for name in [
+        *STATEMENT_SCHEMA["properties"],
+        *PARTNER_SCHEMA["properties"],
+        *SCHEMA["required"],
+    ]:
+        assert name in prompt, name

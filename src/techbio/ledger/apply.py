@@ -77,6 +77,13 @@ class Provenance:
     reviewer: str
     reviewer_kind: str  # human | model-adjudicated | auto-agreement | deterministic
     note: str | None = None
+    document_date: date | None = None  # the document's dateline, if it has one
+
+
+def outcome_date(st: Statement, prov: Provenance) -> date:
+    """When an outcome happened: the date the statement gives, else the document's own date, else
+    the day it was filed (2026-11-05: a 6-K can follow its press release by days)."""
+    return st.event_date or prov.document_date or prov.statement_date
 
 
 @dataclass
@@ -362,7 +369,7 @@ def resolve_event(
         if t and t.enrollment_type == "ACTUAL":
             enrolled = t.enrollment
     ed = cur.get("event_date", (None, None))[0]
-    event_date = date.fromisoformat(ed) if ed else prov.statement_date
+    event_date = date.fromisoformat(ed) if ed else prov.document_date or prov.statement_date
     label_id = result[1] or cur.get("cancelled", (None, None))[1]
     values = dict(
         label_id=label_id,
@@ -455,7 +462,7 @@ def apply_statement(
             created = True
     _enrich_event(conn, event_id, st)
     passage = {"quote": st.quote} if st.quote else None
-    valid_at = datetime.combine(st.event_date or prov.statement_date, datetime.min.time(), UTC)
+    valid_at = datetime.combine(outcome_date(st, prov), datetime.min.time(), UTC)
     resolved = False
     match st.kind:
         case "guidance":
@@ -464,12 +471,18 @@ def apply_statement(
             result = st.result_category or (
                 "discontinued" if st.kind == "discontinuation" else None
             )
+            when = outcome_date(st, prov).isoformat()
+            if st.event_date is None:
+                # An undated restatement (a quarterly release repeating a March result) can move
+                # the date earlier, never later (2026-11-05). A date the document states applies.
+                known = current_labels(conn, event_id).get("event_date", (None, None))[0]
+                when = None if known and known <= when else when
             for f, v in (
                 ("result_category", result),
                 ("result_subtype", st.result_subtype),
                 ("sponsor_explanation_category", st.sponsor_explanation_category),
                 ("stop_data_trigger", st.stop_data_trigger),
-                ("event_date", (st.event_date or prov.statement_date).isoformat()),
+                ("event_date", when),
                 ("adcom_vote_held", st.adcom_vote_held if st.event_type == "adcom" else None),
             ):
                 if v is not None:
@@ -481,7 +494,7 @@ def apply_statement(
                 conn,
                 event_id,
                 "event_date",
-                (st.event_date or prov.statement_date).isoformat(),
+                outcome_date(st, prov).isoformat(),
                 prov,
                 valid_at,
             )

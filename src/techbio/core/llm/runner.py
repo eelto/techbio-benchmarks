@@ -15,11 +15,18 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
 from rich.console import Console
 from sqlalchemy import Engine
 
 from techbio.core.config import model_cfg, settings
-from techbio.core.llm.cache import CompletionCache, LLMRequest, LLMResponse, cache_key
+from techbio.core.llm.cache import (
+    CompletionCache,
+    LLMRequest,
+    LLMResponse,
+    cache_key,
+    is_batch,
+)
 from techbio.core.spend import CapExceeded, Estimate, LineItem, SpendGuard, price_tokens
 
 console = Console(stderr=True)
@@ -42,8 +49,18 @@ def _save_pending(d: dict[str, Any]) -> None:
     p.write_text(json.dumps(d, indent=1))
 
 
-def is_batch(model: dict[str, Any]) -> bool:
-    return model["provider"] in ("anthropic", "openai") and model.get("batch_discount", 1.0) < 1.0
+def schema_error(req: LLMRequest, resp: LLMResponse) -> str | None:
+    """Why an answer does not follow the schema it was asked for, or None if it does. Names the
+    rule and the place only, never a value: values can be document text."""
+    try:
+        answer = resp.parsed()
+    except json.JSONDecodeError:
+        return "answer does not follow the schema: not JSON"
+    err = next(iter(Draft202012Validator(req.json_schema).iter_errors(answer)), None)
+    if err is None:
+        return None
+    where = "/".join(str(p) for p in err.absolute_path)
+    return f"answer does not follow the schema: {err.validator} at /{where}"
 
 
 def worst_case_usd(req: LLMRequest, model: dict[str, Any]) -> float:
@@ -110,6 +127,10 @@ def run(
 
     def _settle(resp: LLMResponse, reserved: float, batch_id: str | None = None) -> None:
         req = by_key[resp.cache_key]
+        if resp.ok:
+            # A provider's schema enforcement can fail silently (Google batch, 2026-11-03). An
+            # answer off the schema is an error: paid for, never cached, asked again next run.
+            resp.error = schema_error(req, resp)
         if resp.ok or resp.tokens_out:
             resp.cost_usd = price_tokens(
                 model, resp.tokens_in, resp.tokens_out, resp.tokens_cached, batch=batch
@@ -128,7 +149,7 @@ def run(
             say(f"collecting earlier batch {batch_id} ({len(meta['keys'])} requests)")
             reserved = meta["reserved_usd"]
             guard.reserved_usd += reserved
-            out = _wait(provider, batch_id, say)
+            out = _wait(provider, batch_id, say, meta["keys"])
             per = reserved / max(len(out), 1)
             for resp in out:
                 if resp.cache_key in by_key:
@@ -137,15 +158,25 @@ def run(
             _save_pending(pending)
             todo = [(k, r) for k, r in todo if k not in results]
         # 3. submit the rest in chunks, reserving the worst case first
-        for i in range(0, len(todo), CHUNK):
-            chunk = todo[i : i + CHUNK]
+        size = getattr(provider, "MAX_REQUESTS", CHUNK)  # Gemini: inline batches under 20 MB
+        for i in range(0, len(todo), size):
+            chunk = todo[i : i + size]
             reserved = sum(worst_case_usd(r, model) for _, r in chunk)
             try:
                 guard.reserve(reserved)
             except CapExceeded as e:
-                say(f"[yellow]stopping before chunk {i // CHUNK + 1}: {e}[/]")
+                say(f"[yellow]stopping before chunk {i // size + 1}: {e}[/]")
                 break
-            batch_id = provider.submit(chunk, model)
+            try:
+                batch_id = provider.submit(chunk, model)
+            except ValueError as e:
+                # Refused, so not created and not charged (2026-11-04). Each request is an error,
+                # none is lost, and the next chunk still goes out.
+                guard.release(reserved)
+                say(f"[yellow]batch of {len(chunk)} refused: {str(e)[:200]}[/]")
+                why = f"batch refused: {e}"[:500]
+                results.update({k: LLMResponse(cache_key=k, text="", error=why) for k, _ in chunk})
+                continue
             pending[batch_id] = {
                 "model_key": model_key,
                 "run_id": run_id,
@@ -154,7 +185,7 @@ def run(
             }
             _save_pending(pending)
             say(f"submitted batch {batch_id}: {len(chunk)} requests to {model['model_version']}")
-            out = _wait(provider, batch_id, say)
+            out = _wait(provider, batch_id, say, [k for k, _ in chunk])
             per = reserved / max(len(out), 1)
             for resp in out:
                 _settle(resp, per, batch_id)
@@ -186,10 +217,12 @@ def _provider(model: dict[str, Any]):
     return provider_for(model)
 
 
-def _wait(provider, batch_id: str, say: Callable[[str], None]) -> list[LLMResponse]:
+def _wait(
+    provider, batch_id: str, say: Callable[[str], None], keys: list[str]
+) -> list[LLMResponse]:
     waited = 0
     while True:
-        out = provider.collect(batch_id)
+        out = provider.collect(batch_id, keys)
         if out is not None:
             return out
         if waited % 300 == 0:

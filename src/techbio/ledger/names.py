@@ -78,11 +78,33 @@ def search_term(name: str) -> str:
 
 
 _SUBSIDIARY = re.compile(r"\bsubsidiary of\s+(.+)$", re.I)
+_A_COMPANY = re.compile(r",\s*an?\s+(.+?)\s+company\s*$", re.I)  # "Kite, A Gilead Company"
+_PLACE = re.compile(r"\s*\([^)]*\)?\s*$")  # "(Rahway, New Jersey USA)", even cut off
 
 
-def same_company(a: str, b: str) -> bool:
-    """A CT.gov lead sponsor named as "X, a wholly owned subsidiary of Y" is Y."""
-    names = [[n, *(m.group(1) for m in [_SUBSIDIARY.search(n)] if m)] for n in (a, b)]
+def _owners(name: str, aliases: list[tuple[str, str]]) -> list[str]:
+    """The name and every company it says it belongs to ("a wholly owned subsidiary of Y", "a Y
+    company"), and through `aliases` (subsidiary name prefix, parent) the parents of subsidiaries
+    whose name does not say so."""
+    out: list[str] = []
+    todo = [name]
+    while todo:
+        raw = todo.pop()
+        n = _PLACE.sub("", raw)
+        if n in out:
+            continue
+        out.append(n)
+        # Read the ownership note before the place is cut: Morphic's is in parentheses.
+        todo += [m.group(1) for rx in (_SUBSIDIARY, _A_COMPANY) if (m := rx.search(raw))]
+        key = company_key(n)
+        todo += [p for lead, p in aliases if f"{key} ".startswith(f"{company_key(lead)} ")]
+    return out
+
+
+def same_company(a: str, b: str, aliases: list[tuple[str, str]] | None = None) -> bool:
+    """A CT.gov lead sponsor that is a wholly owned subsidiary of Y is Y (taxonomy §1): named as
+    such ("X, a wholly owned subsidiary of Y", "X, a Y company"), or listed in `aliases`."""
+    names = [_owners(n, aliases or []) for n in (a, b)]
     return any(_same_company(x, y) for x in names[0] for y in names[1])
 
 
@@ -184,20 +206,33 @@ def _abbreviates(short: str, words: list[str]) -> bool:
     return any(_spells(short.lower(), run) for run in runs)
 
 
+def _indication_relation(a: str | None, b: str | None) -> str | None:
+    """ "same" (a disease word in common, or one abbreviates the other), "different" (neither), or
+    None when either is missing or names no disease ("advanced solid tumors")."""
+    if not a or not b:
+        return None
+    wa, wb = _ind_words(a), _ind_words(b)
+    ca, cb = _content(wa), _content(wb)
+    if not ca or not cb:
+        return None
+    if ca & cb:
+        return "same"
+    for short, words in ((s, wb) for s in wa if _ABBREV.fullmatch(s)):
+        if _abbreviates(short, words):
+            return "same"
+    for short, words in ((s, wa) for s in wb if _ABBREV.fullmatch(s)):
+        if _abbreviates(short, words):
+            return "same"
+    return "different"
+
+
 def indications_conflict(a: str | None, b: str | None) -> bool:
     """True only when two indications clearly name different diseases: no disease word in common,
     and neither is an abbreviation of the other. Anything vaguer ("advanced solid tumors", or a
     missing indication) is not a conflict."""
-    if not a or not b:
-        return False
-    wa, wb = _ind_words(a), _ind_words(b)
-    ca, cb = _content(wa), _content(wb)
-    if not ca or not cb or ca & cb:
-        return False
-    for short, words in ((s, wb) for s in wa if _ABBREV.fullmatch(s)):
-        if _abbreviates(short, words):
-            return False
-    for short, words in ((s, wa) for s in wb if _ABBREV.fullmatch(s)):
-        if _abbreviates(short, words):
-            return False
-    return True
+    return _indication_relation(a, b) == "different"
+
+
+def indications_agree(a: str | None, b: str | None) -> bool:
+    """True when two indications name the same disease by the same test."""
+    return _indication_relation(a, b) == "same"

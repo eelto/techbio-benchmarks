@@ -20,6 +20,14 @@ ctgov:
   base_url: https://clinicaltrials.gov/api/v2/studies
   max_requests_per_second: 5
   phases: [PHASE2, PHASE3]
+  # Wholly owned subsidiaries whose CT.gov lead-sponsor name does not say so. Taxonomy §1 counts
+  # them as the parent. `query` adds a registry search where the parent's own search does not
+  # return them. Added 2026-11-03 from the refresh's rejected names (decisions.md C.4).
+  parent_aliases:
+    - {lead: "Merck Sharp & Dohme", parent: "Merck & Co., Inc."}          # 291 trials
+    - {lead: "Janssen", parent: "Johnson & Johnson", query: "Janssen"}     # J&J's R&D arm
+    - {lead: "Teva Branded Pharmaceutical Products", parent: "Teva Pharmaceutical Industries"}
+    - {lead: "Bausch Health Americas", parent: "Bausch Health Companies"}
 fedreg:
   base_url: https://www.federalregister.gov/api/v1/documents.json
   agency: food-and-drug-administration

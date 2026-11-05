@@ -22,6 +22,7 @@ reading stands.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 
 from sqlalchemy import Connection, func, select
@@ -29,6 +30,24 @@ from sqlalchemy import Connection, func, select
 from techbio.core.db import trials
 from techbio.ledger.names import assets_overlap
 from techbio.ledger.sources.ctgov import TWO_B
+
+# The brief's fixed scope: events from 2025-01-01. An outcome dated earlier never reaches the
+# ledger (2026-11-05: 78 of 172 CT.gov stops had ended before it).
+LEDGER_START = date(2025, 1, 1)
+
+
+def registry_stop_date(t: dict[str, Any] | None) -> date | None:
+    """When a stopped trial ended, as the registry records it: its actual primary completion date
+    (a partial "2024-09" counts from the first of the month). None if the date is not actual."""
+    if (
+        not t
+        or t.get("primary_completion_type") != "ACTUAL"
+        or not t.get("primary_completion_date")
+    ):
+        return None
+    y, m, d = ([*t["primary_completion_date"].split("-"), "01", "01"])[:3]
+    return date(int(y), int(m), int(d))
+
 
 CHECKED = (None, "2", "2b")  # readout phases the rule applies to; "2/3" and "3" are always in
 _CONTROL_ARM = re.compile(

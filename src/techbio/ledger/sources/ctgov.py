@@ -54,9 +54,33 @@ def in_scope_design(t: dict[str, Any]) -> bool:
     return False
 
 
-def _query(sponsor_name: str, since: date) -> dict[str, str]:
+def parent_aliases() -> list[tuple[str, str]]:
+    return [
+        (a["lead"], a["parent"]) for a in load_yaml("sources")["ctgov"].get("parent_aliases", [])
+    ]
+
+
+def search_terms(sponsor_name: str) -> list[str]:
+    """The sponsor's own search, plus one per aliased subsidiary its search does not return."""
+    extra = [
+        a["query"]
+        for a in load_yaml("sources")["ctgov"].get("parent_aliases", [])
+        if a.get("query") and same_company(a["parent"], sponsor_name)
+    ]
+    return [search_term(sponsor_name), *extra]
+
+
+def owner(lead: str, universe: list[tuple[str, str]], aliases: list[tuple[str, str]]) -> str | None:
+    """The one universe sponsor a lead-sponsor name belongs to, or None when it names none or
+    more than one ("a BridgeBio company": BridgeBio Pharma, or the separately listed BridgeBio
+    Oncology Therapeutics)."""
+    ids = {sid for sid, name in universe if same_company(lead, name, aliases)}
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _query(term: str, since: date) -> dict[str, str]:
     return {
-        "query.lead": search_term(sponsor_name),
+        "query.lead": term,
         "filter.advanced": (
             "AREA[StudyType]INTERVENTIONAL AND (AREA[Phase]PHASE2 OR AREA[Phase]PHASE3) AND "
             f"AREA[LastUpdatePostDate]RANGE[{since.isoformat()},MAX]"
@@ -136,29 +160,38 @@ def ingest(
     }
     with engine.connect() as conn:
         spons = conn.execute(select(sponsors.c.sponsor_id, sponsors.c.name)).all()
+    aliases = parent_aliases()
+    universe = [(sp.sponsor_id, sp.name) for sp in spons]
+    owners: dict[str, str | None] = {}
     for sp in spons[:limit] if limit else spons:
         stats["sponsors"] += 1
-        params = _query(sp.name, since)
-        page_token = None
-        while True:
-            q = dict(params, **({"pageToken": page_token} if page_token else {}))
-            fr = fetcher.get(base, params=q, max_age=timedelta(hours=20))
-            data = fr.json()
-            for study in data.get("studies", []):
-                stats["studies"] += 1
-                t = parse_study(study)
-                if not t["nct_id"] or not t["lead_sponsor_name"]:
-                    continue
-                if not same_company(t["lead_sponsor_name"], sp.name):
-                    continue  # CT.gov search is fuzzy; keep only exact lead-sponsor matches
-                stats["matched"] += 1
-                created = _store_trial(engine, fetcher, sp.sponsor_id, t, study)
-                stats["new_versions"] += created[0]
-                stats["stopped_docs"] += created[1]
-                stats["exclusions"] += created[2]
-            page_token = data.get("nextPageToken")
-            if not page_token:
-                break
+        seen: set[str] = set()
+        for term in search_terms(sp.name):
+            params = _query(term, since)
+            page_token = None
+            while True:
+                q = dict(params, **({"pageToken": page_token} if page_token else {}))
+                fr = fetcher.get(base, params=q, max_age=timedelta(hours=20))
+                data = fr.json()
+                for study in data.get("studies", []):
+                    stats["studies"] += 1
+                    t = parse_study(study)
+                    if not t["nct_id"] or not t["lead_sponsor_name"] or t["nct_id"] in seen:
+                        continue
+                    lead = t["lead_sponsor_name"]
+                    if lead not in owners:
+                        owners[lead] = owner(lead, universe, aliases)
+                    if owners[lead] != sp.sponsor_id:
+                        continue  # CT.gov search is fuzzy; keep only exact lead-sponsor matches
+                    seen.add(t["nct_id"])
+                    stats["matched"] += 1
+                    created = _store_trial(engine, fetcher, sp.sponsor_id, t, study)
+                    stats["new_versions"] += created[0]
+                    stats["stopped_docs"] += created[1]
+                    stats["exclusions"] += created[2]
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
     return stats
 
 

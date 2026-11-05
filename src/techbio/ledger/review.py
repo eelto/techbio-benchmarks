@@ -225,6 +225,7 @@ def decide(
             f"human:{reviewer}",
             "human",
             note,
+            date.fromisoformat(p["document_date"]) if p.get("document_date") else None,
         )
         target = event_id if choice == "link" else None
         if choice == "new":

@@ -1,0 +1,11 @@
+# Audit of the ledger's agreed outcomes (decisions V.2 and V.3, operator 2026-11-05).
+# Fixed before the bootstrap extraction runs, so the sample cannot be chosen after the labels are
+# seen. Changing a value after that is a new audit, recorded in docs/decisions.md.
+version: 1
+bootstrap:
+  n: 60
+  seed: 1494543743  # drawn 2026-11-05 with Python's secrets module
+  # 0 or 1 errors in 60 passes (with 1, the 95% upper bound on the error rate is about 9%).
+  pass_max_errors: 1
+  # On a fail, Gemini checks every agreed outcome and each mismatch goes to the operator.
+  on_fail: tiebreak_checks_all_agreed

@@ -52,14 +52,14 @@ DERIVED_EXPLANATIONS = (STRATEGIC_STOP,)
 # Documented data triggers that make a business stop a scored "missed".
 DATA_TRIGGERS = ("interim_analysis", "futility", "dsmb_recommendation")
 
-# Reserved fields: never tie-broken by a model; disagreement or low confidence goes to the human queue.
+# Reserved fields: never tie-broken by a model; a disagreement goes to the human queue. Agreement
+# is accepted whatever the models' self-ratings (V.1, 2026-11-05) and checked by a random audit (V.2).
 RESERVED_FIELDS = (
     "result_category",
     "result_subtype",
     "sponsor_explanation_category",
     "stop_data_trigger",
 )
-RESERVED_CONFIDENCE_TAU = 0.8  # Q-C11 default
 
 # Void reasons that are "unrelated to the outcome" (operator's examples: financing, strategic,
 # acquisition). `operational` (failure to enroll) was confirmed by the operator on 2026-10-30.

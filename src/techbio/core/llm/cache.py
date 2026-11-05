@@ -65,15 +65,27 @@ class LLMResponse:
         return json.loads(self.text)
 
 
+def is_batch(model: dict[str, Any]) -> bool:
+    return (
+        model["provider"] in ("anthropic", "openai", "google")
+        and model.get("batch_discount", 1.0) < 1.0
+    )
+
+
 def request_params(req: LLMRequest, model: dict[str, Any]) -> dict[str, Any]:
     """Everything besides the prompt that can change the completion."""
-    return {
+    params = {
         "max_output_tokens": req.max_output_tokens,
         "reasoning": model.get("reasoning", {}),
         "schema_sha256": sha256_json(req.json_schema),
         "schema_name": req.schema_name,
         "seed": model.get("seed"),
     }
+    if model["provider"] == "google" and is_batch(model):
+        # Google's batch service ignored `response_json_schema` (pilot, 2026-11-03), so batch
+        # requests send `response_schema`: a different request from the synchronous one.
+        params["schema_field"] = "response_schema"
+    return params
 
 
 def cache_key(req: LLMRequest, model: dict[str, Any]) -> str:

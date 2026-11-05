@@ -6,21 +6,26 @@ Per document:
 3. Each statement's quote is checked against the document (ledger/quotes.py): exact and
    near-verbatim quotes are kept; the rest are dropped, and every check is logged in quote_checks
    with the claimed quote and the nearest source span (drop rate and a sample go in the summary).
-4. Statements are paired across models by event type, asset and trial.
+4. Each model's repeats of one event collapse into one statement. Statements are then paired across
+   models by event type, asset, trial and disease, best match first. Partner mentions (another
+   company's trial or application, decision R.1) are counted and kept, and never paired or routed.
 5. Routing per pair:
-   - all compared fields agree, and reserved-field confidence >= tau -> auto-accept;
+   - all compared fields agree -> auto-accept (V.1, 2026-11-05: the models' self-ratings are
+     stored but route nothing; a random audit of agreed outcomes checks this path, V.2);
    - a non-reserved field disagrees, or only one model found the statement -> the tie-break model
      (third vendor) must pick A or B; "neither" goes to the queue;
-   - a reserved field (result category, stop subtype, data trigger, explanation category) disagrees
-     or has low confidence -> human queue. Models never break ties on reserved fields.
+   - a reserved field (result category, stop subtype, data trigger, explanation category)
+     disagrees -> human queue. Models never break ties on reserved fields.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
+from functools import cached_property
 from importlib import resources
 from typing import Any
 
@@ -28,7 +33,7 @@ from rich.console import Console
 from sqlalchemy import Engine, select, update
 
 from techbio.core.config import model_cfg
-from techbio.core.db import extractions, now, review_queue, sources, sponsors
+from techbio.core.db import extractions, now, review_queue, sources, sponsors, trials
 from techbio.core.ids import new_id
 from techbio.core.ids import run_id as make_run_id
 from techbio.core.llm import runner
@@ -36,22 +41,33 @@ from techbio.core.llm.cache import CompletionCache, LLMRequest, LLMResponse, cac
 from techbio.core.spend import DryRun, SpendGuard
 from techbio.ledger import prefilter
 from techbio.ledger.apply import Provenance, Statement, apply_statement
-from techbio.ledger.names import assets_overlap
+from techbio.ledger.names import (
+    assets_overlap,
+    indications_agree,
+    indications_conflict,
+    same_company,
+)
 from techbio.ledger.quotes import QuoteMatch, match_quote, record_check
-from techbio.ledger.scope import attribution, facts, readout_scope, registry_trial
+from techbio.ledger.scope import (
+    LEDGER_START,
+    attribution,
+    facts,
+    readout_scope,
+    registry_stop_date,
+    registry_trial,
+)
 from techbio.ledger.sources.ctgov import parse_study, stop_document
 from techbio.ledger.taxonomy import (
     ALL_RESULTS,
     DATA_TRIGGERS,
     EXPLANATIONS,
-    RESERVED_CONFIDENCE_TAU,
     RESERVED_FIELDS,
     STOP_SUBTYPES,
 )
 from techbio.ledger.timing import iso_or_none, parse_timing
 
 console = Console(stderr=True)
-PROMPT_VERSION = "extract_v1"
+PROMPT_VERSION = "extract_v2"  # v1 until 2026-11-03; v2 adds the pilot's fixes and partner mentions
 EXTRACTORS = ("extractor_a", "extractor_b")
 TIEBREAK = "tiebreak"
 TIEBREAK_REFERENCE = "tiebreak_reference"  # pilot only: checks the tie-breaker
@@ -118,11 +134,27 @@ STATEMENT_SCHEMA: dict[str, Any] = {
         "confidence": {"type": "number"},
     },
 }
+PARTNER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["asset_name", "event_type", "trial_name", "nct_id", "run_by", "quote"],
+    "properties": {
+        "asset_name": {"type": "string"},
+        "event_type": STATEMENT_SCHEMA["properties"]["event_type"],
+        "trial_name": {"type": ["string", "null"]},
+        "nct_id": {"type": ["string", "null"]},
+        "run_by": {"type": ["string", "null"]},
+        "quote": {"type": "string"},
+    },
+}
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["statements"],
-    "properties": {"statements": {"type": "array", "items": STATEMENT_SCHEMA}},
+    "required": ["statements", "partner_mentions"],
+    "properties": {
+        "statements": {"type": "array", "items": STATEMENT_SCHEMA},
+        "partner_mentions": {"type": "array", "items": PARTNER_SCHEMA},
+    },
 }
 TB_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -146,7 +178,7 @@ TB_SCHEMA: dict[str, Any] = {
 }
 TB_ADDENDUM = """
 
-You are now the tie-breaker. Two independent extractors read the same document and disagree. For each disputed field listed, decide which candidate the document supports: "A", "B", or "neither" if the document supports neither value. The field "exists" asks whether the event statement in candidate A is supported by the document at all (B means no such statement should be reported). Quote the sentence that decides it, character-for-character. Judge only from the document."""
+You are now the tie-breaker. Two independent extractors read the same document and disagree. For each disputed field listed, decide which candidate the document supports: "A", "B", or "neither" if the document supports neither value. The field "exists" asks whether the event statement in candidate A should be reported at all: B means it should not, because the document does not support it or the rules above put it out of scope. Quote the sentence that decides it, character-for-character. Judge only from the document."""
 
 
 def system_prompt() -> str:
@@ -205,6 +237,50 @@ class Doc:
             else self.src["retrieved_at"].date()
         )
 
+    @cached_property
+    def document_date(self) -> date | None:
+        """The date the document carries, for outcomes the extractors leave undated."""
+        return (
+            None if self.src["type"] == "ctgov" else dateline(self.full_text, self.statement_date)
+        )
+
+
+_MONTH = (
+    r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?"
+    r"|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?"
+)
+_DATE = re.compile(
+    rf"\b(?:{_MONTH}\s+(\d{{1,2}}),?\s+(\d{{4}})|(?<![\d.])(\d{{1,2}})\s+{_MONTH}\s+(\d{{4}}))\b",
+    re.I,
+)
+# A balance or period date ("cash as of June 30", "the quarter ended September 30") is not a release
+# date, however close to the filing.
+_NOT_A_DATELINE = re.compile(r"(?:as\s+of|ended|ending|through)\s*$", re.I)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+DATELINE_CHARS = 1500  # a release's dateline follows its headline
+# Measured on the pool (2026-11-05): 87% of datelines are the filing day and 9% one to four days
+# earlier (a 6-K trails its release). Past two weeks, the dates found were period ends and slide
+# page numbers.
+DATELINE_DAYS = 14
+
+
+def dateline(text: str, filed: date) -> date | None:
+    """The first date near the top of a document that could be its release date: on or before the
+    filing date and at most two weeks earlier (run 7: Sanofi's COAST 1, released 2026-03-28 and
+    filed 2026-03-31). A later date is an upcoming event; an earlier one is something else."""
+    head = text[:DATELINE_CHARS]
+    for m in _DATE.finditer(head):
+        if _NOT_A_DATELINE.search(head[max(0, m.start() - 20) : m.start()]):
+            continue
+        month, day, year = (m[1], m[2], m[3]) if m[1] else (m[5], m[4], m[6])
+        try:
+            d = date(int(year), _MONTHS.index(month[:3].lower()) + 1, int(day))
+        except ValueError:
+            continue
+        if filed - timedelta(days=DATELINE_DAYS) <= d <= filed:
+            return d
+    return None
+
 
 def pending_docs(
     engine: Engine, limit: int | None = None, source_ids: list[str] | None = None
@@ -219,6 +295,20 @@ def pending_docs(
         q = q.where(sources.c.source_id.in_(source_ids))
     if limit:
         q = q.limit(limit)
+    return _docs(engine, q)
+
+
+def docs_by_id(engine: Engine, source_ids: list[str]) -> list[Doc]:
+    """Documents already extracted, for a tie-break that has to be asked again."""
+    q = (
+        select(sources, sponsors.c.name.label("sponsor_name"), sponsors.c.tickers)
+        .join(sponsors, sponsors.c.sponsor_id == sources.c.sponsor_id)
+        .where(sources.c.source_id.in_(source_ids))
+    )
+    return _docs(engine, q)
+
+
+def _docs(engine: Engine, q) -> list[Doc]:
     with engine.connect() as conn:
         rows = conn.execute(q).mappings().all()
     docs = []
@@ -334,6 +424,28 @@ def parse_candidates(model_key: str, resp: LLMResponse | None, doc: Doc) -> list
     return out
 
 
+Mention = tuple[dict[str, Any], str | None, QuoteMatch]  # (fields, claimed quote, check)
+MENTION_FIELDS = ("asset_name", "event_type", "trial_name", "nct_id", "run_by")
+
+
+def parse_partner_mentions(resp: LLMResponse | None, doc: Doc) -> list[Mention]:
+    """Another company's trial or application named in the document (prompt v2, decision R.1).
+    Kept to measure what R.1 leaves out; never a statement."""
+    try:
+        items = resp.parsed().get("partner_mentions") or []
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return []
+    return [
+        (
+            {f: m.get(f) for f in MENTION_FIELDS},
+            m.get("quote"),
+            match_quote(m.get("quote"), doc.full_text),
+        )
+        for m in items
+        if isinstance(m, dict) and m.get("asset_name")
+    ]
+
+
 def same_event(a: Statement, b: Statement) -> bool:
     if a.event_type != b.event_type or not assets_overlap(a.names(), b.names()):
         return False
@@ -346,16 +458,60 @@ def same_event(a: Statement, b: Statement) -> bool:
     )
 
 
+def match_score(a: Statement, b: Statement) -> int | None:
+    """How strongly two statements describe one event; None when they cannot. Two clearly different
+    diseases never match, even under one NCT number (pilot run 3, case 5: one extractor gave a
+    sickle cell readout the LR-MDS trial's number)."""
+    if not same_event(a, b) or indications_conflict(a.indication, b.indication):
+        return None
+    return (
+        8 * bool(a.nct_id and a.nct_id == b.nct_id)
+        + 4 * bool(a.trial_name and b.trial_name)  # same_event has checked that they agree
+        + 2 * indications_agree(a.indication, b.indication)
+        + (a.kind == b.kind)
+        + (field_value(a, "window") == field_value(b, "window"))
+    )
+
+
 def pair(a: list[Cand], b: list[Cand]) -> list[tuple[Cand | None, Cand | None]]:
-    out: list[tuple[Cand | None, Cand | None]] = []
-    used: set[int] = set()
-    for ca in a:
-        match = next((cb for cb in b if cb.idx not in used and same_event(ca.st, cb.st)), None)
-        if match:
-            used.add(match.idx)
-        out.append((ca, match))
-    out.extend((None, cb) for cb in b if cb.idx not in used)
+    """Strongest matches first, so a statement is not taken by a weaker partner it happens to
+    precede. Ties keep document order."""
+    scored = sorted(
+        (-s, i, j)
+        for i, ca in enumerate(a)
+        for j, cb in enumerate(b)
+        if (s := match_score(ca.st, cb.st)) is not None
+    )
+    a_to_b: dict[int, int] = {}
+    for _, i, j in scored:
+        if i not in a_to_b and j not in a_to_b.values():
+            a_to_b[i] = j
+    out: list[tuple[Cand | None, Cand | None]] = [
+        (ca, b[a_to_b[i]] if i in a_to_b else None) for i, ca in enumerate(a)
+    ]
+    out.extend((None, cb) for j, cb in enumerate(b) if j not in a_to_b.values())
     return out
+
+
+def collapse_duplicates(cands: list[Cand]) -> list[Cand]:
+    """One model's repeats of one event (the text, a table, a summary list) become one candidate,
+    with gaps filled from the repeats. Repeats that differ in any compared field stay apart, so the
+    disagreement still reaches routing (pilot: Vor Bio, one readout reported three times)."""
+    kept: list[Cand] = []
+    for c in cands:
+        dup = next(
+            (
+                k
+                for k in kept
+                if match_score(k.st, c.st) is not None and not disputed_fields(k.st, c.st)
+            ),
+            None,
+        )
+        if dup is None:
+            kept.append(c)
+        else:
+            dup.st = merge(dup.st, c.st)
+    return kept
 
 
 def field_value(st: Statement, f: str) -> Any:
@@ -443,6 +599,53 @@ def _write_extraction_rows(
             )
 
 
+def _write_partner_rows(
+    conn, run: str, doc: Doc, mentions: dict[str, list[Mention]], keys: dict[str, str]
+) -> None:
+    for model_key, found in mentions.items():
+        m = model_cfg(model_key)
+        for i, (value, quote, qm) in enumerate(found):
+            conn.execute(
+                extractions.insert().values(
+                    extraction_id=new_id("ext"),
+                    run_id=run,
+                    source_id=doc.src["source_id"],
+                    statement_idx=i,
+                    candidate_key=f"partner|{value['asset_name']}",
+                    field="partner_mention",
+                    value=value,
+                    quote=quote,
+                    quote_verified=qm.accepted,
+                    model_key=model_key,
+                    model_version=m["model_version"],
+                    prompt_hash=keys[model_key + "_prompt"],
+                    completion_key=keys[model_key],
+                    created_recorded_at=now(),
+                )
+            )
+
+
+def _count_partner_mentions(
+    stats: dict[str, Any], mentions: dict[str, list[Mention]], universe: list[str]
+) -> None:
+    """Per model, quote-verified mentions by whether the company named as running the trial is in
+    the universe (its own filings carry the event) or not (R.1 leaves it out). Matching is by name,
+    so a short form the matcher misses ("Lilly") counts as outside."""
+    for model_key, found in mentions.items():
+        n = stats["partner_mentions"][model_key]
+        for value, _quote, qm in found:
+            if not qm.accepted:
+                continue
+            n["n"] += 1
+            run_by = value.get("run_by")
+            if not run_by:
+                n["run_by_not_stated"] += 1
+            elif any(same_company(run_by, name) for name in universe):
+                n["in_universe"] += 1
+            else:
+                n["outside_universe"] += 1
+
+
 def _queue(
     conn,
     doc: Doc,
@@ -457,6 +660,7 @@ def _queue(
         "source_id": doc.src["source_id"],
         "sponsor_id": doc.src["sponsor_id"],
         "statement_date": doc.statement_date.isoformat(),
+        "document_date": doc.document_date.isoformat() if doc.document_date else None,
         "url": doc.src["url"],
         **payload,
     }
@@ -491,6 +695,8 @@ LENIENCY = ("in", "ask", "out")
 
 
 def _scope_one(conn, doc: Doc, st: Statement) -> Verdict:
+    if st.kind != "guidance" and st.event_date and st.event_date < LEDGER_START:
+        return "out", f"dated before the ledger's start ({LEDGER_START})", None, "event_date"
     if st.event_type != "readout":
         return "in", "", None, "phase"
     sponsor = doc.src["sponsor_id"]
@@ -506,15 +712,38 @@ def _out_of_scope(conn, doc: Doc, st: Statement, verdict: Verdict, stats: dict[s
     """A readout the registry rules out never reaches the ledger; the drop stays on record."""
     _, why, t, field = verdict
     payload = {"statement": st.to_json(), "scope": why, "registry": facts(t)}
-    _queue(conn, doc, "scope_check", field, payload, closed_by="auto:registry")
+    by = "auto:scope" if field == "event_date" else "auto:registry"
+    _queue(conn, doc, "scope_check", field, payload, closed_by=by)
     stats["out_of_scope"] += 1
+
+
+def _date_registry_stops(conn, doc: Doc, cands: list[Cand]) -> None:
+    """A CT.gov stop happened when the registry says the trial ended, not when its record was last
+    edited (2026-11-05: NCT05074420 ended 2024-09-05 and was stored as a 2026-08-11 stop). Both
+    candidates take the registry's date, so it never splits a pair."""
+    nct = doc.src["meta"].get("nct_id")
+    t = (
+        conn.execute(select(trials).where(trials.c.nct_id == nct)).mappings().first()
+        if nct
+        else None
+    )
+    stop = registry_stop_date(dict(t) if t else None)
+    if stop:
+        for c in cands:
+            if c.st.result_category == "stopped":
+                c.st.event_date = stop
 
 
 def _accept(
     conn, doc: Doc, st: Statement, reviewer: str, reviewer_kind: str, stats: dict[str, int]
 ) -> None:
     prov = Provenance(
-        doc.src["source_id"], doc.src["sponsor_id"], doc.statement_date, reviewer, reviewer_kind
+        doc.src["source_id"],
+        doc.src["sponsor_id"],
+        doc.statement_date,
+        reviewer,
+        reviewer_kind,
+        document_date=doc.document_date,
     )
     if doc.src["type"] == "ctgov" and not st.nct_id:
         st.nct_id = doc.src["meta"].get("nct_id")  # the registry record is that trial
@@ -559,15 +788,26 @@ def tiebreak_keys(compare: bool) -> tuple[str, ...]:
     return (TIEBREAK, TIEBREAK_REFERENCE) if compare else (TIEBREAK,)
 
 
-def estimate_job(engine: Engine, docs: list[Doc], job_kind: str, compare_tiebreak: bool = False):
+def estimate_job(
+    engine: Engine,
+    docs: list[Doc],
+    job_kind: str,
+    compare_tiebreak: bool = False,
+    retries: list[tuple[Any, dict[str, Any]]] = (),
+):
     cache = CompletionCache(engine)
     reqs = {k: [build_request(d, k) for d in docs] for k in EXTRACTORS}
     tb_n = math.ceil(len(docs) * TIEBREAK_SHARE)
     for k in tiebreak_keys(compare_tiebreak):
         reqs[k] = [build_request(d, k) for d in docs[:tb_n]]
+    reqs[TIEBREAK] += [
+        _tiebreak_request(d, a, b, disp, TIEBREAK) for (d, _, a, b, disp), _ in retries
+    ]
     expected = {k: int(model_cfg(k).get("expected_output_tokens", 1500)) for k in reqs}
     est = runner.estimate(job_kind, reqs, cache, expected)
     est.notes.append(f"tie-break assumed for {TIEBREAK_SHARE:.0%} of documents")
+    if retries:
+        est.notes.append(f"{len(retries)} failed tie-break(s) asked again")
     tps = model_cfg(TIEBREAK).get("output_tokens_per_s")
     if tps:
         hours = tb_n * expected[TIEBREAK] / tps / 3600
@@ -587,18 +827,22 @@ def run_extraction(
 ) -> dict[str, Any]:
     pf = run_prefilter(engine)
     docs = pending_docs(engine, limit, source_ids)
+    retries = [r for r in retry_jobs(engine) if not source_ids or r[1]["source_id"] in source_ids]
     run = make_run_id("ledger")
-    console.print(f"prefilter: {pf}; documents to extract: {len(docs)}")
-    if not docs:
+    console.print(
+        f"prefilter: {pf}; documents to extract: {len(docs)}; tie-breaks to retry: {len(retries)}"
+    )
+    if not docs and not retries:
         return {"prefilter": pf, "documents": 0}
     guard = SpendGuard(engine, job_kind, run, execute=execute, approval=approval)
     try:
-        guard.authorize(estimate_job(engine, docs, job_kind, compare_tiebreak))
+        guard.authorize(estimate_job(engine, docs, job_kind, compare_tiebreak, retries))
     except DryRun as e:
         console.print(f"[cyan]{e}[/]")
         return {
             "prefilter": pf,
             "documents": len(docs),
+            "tiebreak_retries": len(retries),
             "dry_run": True,
             "est_usd": guard.estimate.total_usd if guard.estimate else None,
         }
@@ -609,12 +853,20 @@ def run_extraction(
         "accepted": 0,
         "queued": 0,
         "tiebreaks": 0,
+        "tiebreak_retries": len(retries),
         "events_created": 0,
         "resolved": 0,
         "quote_dropped": 0,
         "quote_fuzzy": 0,
         "out_of_scope": 0,
+        "duplicates_collapsed": 0,
+        "partner_mentions": {
+            k: {"n": 0, "in_universe": 0, "outside_universe": 0, "run_by_not_stated": 0}
+            for k in EXTRACTORS
+        },
     }
+    with engine.connect() as conn:
+        universe = list(conn.execute(select(sponsors.c.name)).scalars())
     try:
         # A local tie-break server that is down must stop the job before the extractors spend.
         for k in tiebreak_keys(compare_tiebreak):
@@ -641,8 +893,11 @@ def run_extraction(
                 continue  # stopped by the cap or an error; the document stays pending
             ca = parse_candidates(EXTRACTORS[0], got[EXTRACTORS[0]], d)
             cb = parse_candidates(EXTRACTORS[1], got[EXTRACTORS[1]], d)
+            mentions = {k: parse_partner_mentions(got[k], d) for k in EXTRACTORS}
             with engine.begin() as conn:
                 _write_extraction_rows(conn, run, d, ca + cb, keys[sid])
+                _write_partner_rows(conn, run, d, mentions, keys[sid])
+                _count_partner_mentions(stats, mentions, universe)
                 for c in ca + cb:
                     record_check(
                         conn,
@@ -657,7 +912,12 @@ def run_extraction(
                     )
                 stats["quote_dropped"] += sum(1 for c in ca + cb if not c.quote_ok)
                 stats["quote_fuzzy"] += sum(1 for c in ca + cb if c.qm.method == "fuzzy")
-                for a, b in pair([c for c in ca if c.quote_ok], [c for c in cb if c.quote_ok]):
+                verified = [[c for c in cands if c.quote_ok] for cands in (ca, cb)]
+                a_ok, b_ok = (collapse_duplicates(cands) for cands in verified)
+                stats["duplicates_collapsed"] += sum(map(len, verified)) - len(a_ok) - len(b_ok)
+                if d.src["type"] == "ctgov":
+                    _date_registry_stops(conn, d, a_ok + b_ok)
+                for a, b in pair(a_ok, b_ok):
                     v = _scope(conn, d, [c.st for c in (a, b) if c])
                     if v[0] == "out":  # before any tie-break or operator time is spent
                         _out_of_scope(conn, d, (a or b).st, v, stats)
@@ -665,22 +925,8 @@ def run_extraction(
                     if a and b:
                         disputed = disputed_fields(a.st, b.st)
                         reserved = [f for f in disputed if f in RESERVED]
-                        has_reserved = any(field_value(a.st, f) is not None for f in RESERVED)
-                        low_conf = (
-                            has_reserved
-                            and min(a.confidence, b.confidence) < RESERVED_CONFIDENCE_TAU
-                        )
-                        if reserved or low_conf:
-                            _queue(
-                                conn,
-                                d,
-                                "disagreement" if reserved else "low_confidence",
-                                ",".join(
-                                    reserved
-                                    or [f for f in RESERVED if field_value(a.st, f) is not None]
-                                ),
-                                _payload(a, b),
-                            )
+                        if reserved:
+                            _queue(conn, d, "disagreement", ",".join(reserved), _payload(a, b))
                             stats["queued"] += 1
                         elif disputed:
                             tb_jobs.append((d, merge(a.st, b.st), a, b, disputed))
@@ -705,9 +951,11 @@ def run_extraction(
                     update(sources).where(sources.c.source_id == sid).values(extract_status="done")
                 )
 
-        if tb_jobs:
-            stats["tiebreaks"] = len(tb_jobs)
-            _run_tiebreaks(engine, guard, run, tb_jobs, stats, compare_tiebreak)
+        jobs = tb_jobs + [j for j, _ in retries]
+        if jobs:
+            stats["tiebreaks"] = len(jobs)
+            retry_of = {len(tb_jobs) + n: item for n, (_, item) in enumerate(retries)}
+            _run_tiebreaks(engine, guard, run, jobs, stats, compare_tiebreak, retry_of)
     except Exception:
         status = "failed"
         raise
@@ -769,23 +1017,106 @@ def _choices(resp: LLMResponse | None) -> dict[str, str]:
         return {}
 
 
+TIEBREAK_TRIES = 3  # in all; then the dispute stays with the operator
+_FAILED = ("tie-break failed", "tie-break not run")
+
+
+def retry_jobs(engine: Engine) -> list[tuple[Any, dict[str, Any]]]:
+    """Tie-breaks that failed or never ran (a refused batch, a crash, the cap), each with the queue
+    item holding it, to be asked again on the next run (2026-11-05). A model's own "neither" is a
+    decision and stays with the operator, as does a dispute that has failed TIEBREAK_TRIES times."""
+    with engine.connect() as conn:
+        items = [
+            dict(i)
+            for i in conn.execute(
+                select(review_queue)
+                .where(
+                    review_queue.c.status == "open",
+                    review_queue.c.reason == "tiebreak_abstained",
+                )
+                .order_by(review_queue.c.created_at)
+            ).mappings()
+            if str(i["payload"].get("note", "")).startswith(_FAILED)
+            and i["payload"].get("attempts", 1) < TIEBREAK_TRIES
+        ]
+    if not items:
+        return []
+    docs = {d.src["source_id"]: d for d in docs_by_id(engine, [i["source_id"] for i in items])}
+    out = []
+    for i in items:
+        p, d = i["payload"], docs.get(i["source_id"])
+        if d is None:
+            continue
+        a, b = _cand(p, "A"), _cand(p, "B")
+        st = merge(a.st, b.st) if a and b else (a or b).st
+        out.append(((d, st, a, b, i["field"].split(",")), i))
+    return out
+
+
+def _cand(p: dict[str, Any], slot: str) -> Cand | None:
+    """A candidate rebuilt from a queue item: as much of it as a tie-break uses (its quote check is
+    on record from the run that found it)."""
+    if p["candidates"][slot] is None:
+        return None
+    st = Statement.from_json(p["candidates"][slot])
+    conf = p["confidence"][slot] or 0.0
+    return Cand(p["models"][slot], 0, {"quote": p["quotes"][slot]}, st, conf, None)
+
+
 def _run_tiebreaks(
-    engine: Engine, guard: SpendGuard, run: str, jobs, stats: dict[str, int], compare: bool = False
+    engine: Engine,
+    guard: SpendGuard,
+    run: str,
+    jobs,
+    stats: dict[str, int],
+    compare: bool = False,
+    retry_of: dict[int, dict[str, Any]] | None = None,
 ) -> None:
     m = model_cfg(TIEBREAK)
     reqs = [_tiebreak_request(d, a, b, disputed, TIEBREAK) for d, _st, a, b, disputed in jobs]
-    out = runner.run(engine, guard, TIEBREAK, reqs, run)
+    retry_of = retry_of or {}
+
+    def tried(conn, n: int) -> dict[str, Any]:
+        """Close the queue item job n was retried from; the try count for any item it opens."""
+        old = retry_of.get(n)
+        if old is None:
+            return {}
+        conn.execute(
+            update(review_queue)
+            .where(review_queue.c.item_id == old["item_id"])
+            .values(status="closed", closed_at=now(), closed_by="auto:retry")
+        )
+        return {"attempts": old["payload"].get("attempts", 1) + 1}
+
+    try:
+        out = runner.run(engine, guard, TIEBREAK, reqs, run)
+    except Exception as e:
+        # The documents are already marked done, so a dispute not queued here would be lost
+        # (2026-11-04). Queue every one, then fail the job.
+        with engine.begin() as conn:
+            for n, (d, _st, a, b, disputed) in enumerate(jobs):
+                note = f"tie-break not run: {type(e).__name__}"
+                _queue(
+                    conn,
+                    d,
+                    "tiebreak_abstained",
+                    ",".join(disputed),
+                    {**_payload(a, b), "note": note, **tried(conn, n)},
+                )
+        stats["queued"] += len(jobs)
+        raise
     _note_errors(stats, TIEBREAK, out)
-    for (d, st, a, b, disputed), req in zip(jobs, reqs, strict=True):
+    for n, ((d, st, a, b, disputed), req) in enumerate(zip(jobs, reqs, strict=True)):
         resp = out.get(cache_key(req, m))
         with engine.begin() as conn:
+            again = tried(conn, n)
             if resp is None:
                 _queue(
                     conn,
                     d,
                     "tiebreak_abstained",
                     ",".join(disputed),
-                    {**_payload(a, b), "note": "tie-break not run (cap)"},
+                    {**_payload(a, b), "note": "tie-break not run (cap)", **again},
                 )
                 stats["queued"] += 1
                 continue
@@ -830,12 +1161,14 @@ def _run_tiebreaks(
             elif "exists" in disputed and choices.get("exists", {}).get("choice") == "B":
                 stats["rejected_by_tiebreak"] = stats.get("rejected_by_tiebreak", 0) + 1
             else:
+                # A failed answer is not the model declining: say so to the operator.
+                failed = {} if resp.ok else {"note": f"tie-break failed: {resp.error}"}
                 _queue(
                     conn,
                     d,
                     "tiebreak_abstained",
                     ",".join(disputed),
-                    {**_payload(a, b), "tiebreak": choices},
+                    {**_payload(a, b), "tiebreak": choices, **failed, **again},
                 )
                 stats["queued"] += 1
     if compare:

@@ -1,7 +1,8 @@
 """Thin provider adapters over each official SDK, plus a local Ollama model over its HTTP API.
 
-Batch where the provider offers it on our path (Anthropic, OpenAI); synchronous otherwise (Google,
-and the local model, which has no batch path). No sampling parameters are sent: current flagships
+Batch where the provider offers it on our path (Anthropic, OpenAI, and Google since 2026-11-03 for
+models configured with a batch discount); synchronous otherwise (the local model has no batch
+path). No sampling parameters are sent: current flagships
 reject temperature, and the same rule applies to every vendor. The local model gets only a fixed
 seed. Reasoning settings and seeds come from config/models.yaml and are recorded in the cache key.
 """
@@ -21,7 +22,8 @@ from techbio.core.llm.cache import LLMRequest, LLMResponse
 class BatchProvider(Protocol):
     def submit(self, items: list[tuple[str, LLMRequest]], model: dict[str, Any]) -> str: ...
 
-    def collect(self, batch_id: str) -> list[LLMResponse] | None: ...
+    # `keys` are the batch's cache keys in submission order (for providers that echo none).
+    def collect(self, batch_id: str, keys: list[str]) -> list[LLMResponse] | None: ...
 
 
 class SyncProvider(Protocol):
@@ -62,7 +64,7 @@ class AnthropicBatch:
         )
         return batch.id
 
-    def collect(self, batch_id: str) -> list[LLMResponse] | None:
+    def collect(self, batch_id: str, keys: list[str] | None = None) -> list[LLMResponse] | None:
         batch = self.client.messages.batches.retrieve(batch_id)
         if batch.processing_status != "ended":
             return None
@@ -153,7 +155,7 @@ class OpenAIBatch:
         )
         return batch.id
 
-    def collect(self, batch_id: str) -> list[LLMResponse] | None:
+    def collect(self, batch_id: str, keys: list[str] | None = None) -> list[LLMResponse] | None:
         batch = self.client.batches.retrieve(batch_id)
         if batch.status not in ("completed", "failed", "expired", "cancelled"):
             return None
@@ -204,6 +206,64 @@ class OpenAIBatch:
 # --------------------------------------------------------------------------- Google
 
 
+def batch_schema(schema: Any) -> Any:
+    """The schema as the batch service's `response_schema` takes it: a fresh copy without
+    `additionalProperties`, which that field lacks (Google refused the batch, 2026-11-04). The
+    schema check (`runner.schema_error`) still enforces it on every answer. A copy, because the
+    SDK edits the schema it is handed (it adds `property_ordering`), and a request's schema is part
+    of its cache key."""
+    if isinstance(schema, dict):
+        return {
+            k: batch_schema(v)
+            for k, v in schema.items()
+            if not (k == "additionalProperties" and isinstance(v, bool))
+        }
+    if isinstance(schema, list):
+        return [batch_schema(v) for v in schema]
+    return schema
+
+
+def google_config(req: LLMRequest, model: dict[str, Any], batch: bool = False):
+    """One request config for both paths, except the schema field. The batch service ignored
+    `response_json_schema` (pilot re-measure, 2026-11-03: six tie-break answers in shapes of the
+    model's own choosing), so batch requests send `response_schema`, as Google's batch docs do,
+    in the form `batch_schema` gives. The synchronous path keeps `response_json_schema`, which it
+    honored in pilot run 3. The cache key tells the two apart (`request_params`)."""
+    from google.genai import types
+
+    reasoning = model.get("reasoning", {})
+    schema = (
+        {"response_schema": batch_schema(req.json_schema)}
+        if batch
+        else {"response_json_schema": req.json_schema}
+    )
+    return types.GenerateContentConfig(
+        system_instruction=req.system,
+        response_mime_type="application/json",
+        **schema,
+        max_output_tokens=req.max_output_tokens,
+        thinking_config=types.ThinkingConfig(thinking_level=reasoning["thinking_level"])
+        if "thinking_level" in reasoning
+        else None,
+    )
+
+
+def _google_response(key: str, r) -> LLMResponse:
+    u = r.usage_metadata
+    thoughts = (getattr(u, "thoughts_token_count", 0) or 0) if u else 0
+    return LLMResponse(
+        cache_key=key,
+        text=r.text or "",
+        tokens_in=(u.prompt_token_count or 0) if u else 0,
+        tokens_cached=(getattr(u, "cached_content_token_count", 0) or 0) if u else 0,
+        tokens_out=((u.candidates_token_count or 0) if u else 0) + thoughts,
+        tokens_reasoning=thoughts,
+        stop_reason=str(r.candidates[0].finish_reason) if r.candidates else None,
+        error=None if r.text else "empty",
+        raw=r.model_dump(mode="json", exclude_none=True),
+    )
+
+
 class GoogleSync:
     def __init__(self) -> None:
         from google import genai
@@ -211,37 +271,94 @@ class GoogleSync:
         self.client = genai.Client(api_key=secret("GOOGLE_API_KEY"))
 
     def call(self, key: str, req: LLMRequest, model: dict[str, Any]) -> LLMResponse:
-        from google.genai import types
-
-        reasoning = model.get("reasoning", {})
-        config = types.GenerateContentConfig(
-            system_instruction=req.system,
-            response_mime_type="application/json",
-            response_json_schema=req.json_schema,
-            max_output_tokens=req.max_output_tokens,
-            thinking_config=types.ThinkingConfig(thinking_level=reasoning["thinking_level"])
-            if "thinking_level" in reasoning
-            else None,
-        )
         try:
             r = self.client.models.generate_content(
-                model=model["model_version"], contents=req.user, config=config
+                model=model["model_version"], contents=req.user, config=google_config(req, model)
             )
         except Exception as e:  # SDK raises typed errors; record and let the runner queue it
             return LLMResponse(cache_key=key, text="", error=f"{type(e).__name__}: {e}"[:500])
-        u = r.usage_metadata
-        thoughts = getattr(u, "thoughts_token_count", 0) or 0
-        return LLMResponse(
-            cache_key=key,
-            text=r.text or "",
-            tokens_in=u.prompt_token_count or 0,
-            tokens_cached=getattr(u, "cached_content_token_count", 0) or 0,
-            tokens_out=(u.candidates_token_count or 0) + thoughts,
-            tokens_reasoning=thoughts,
-            stop_reason=str(r.candidates[0].finish_reason) if r.candidates else None,
-            error=None if r.text else "empty",
-            raw=r.model_dump(mode="json", exclude_none=True),
-        )
+        return _google_response(key, r)
+
+
+class GoogleBatch:
+    """Gemini Batch API (Q-G2, 2026-11-03): half the interactive price, 24-hour target.
+
+    Requests go inline, each tagged with its cache key in `metadata`. Google documents the key echo
+    only for file input, and the SDK says inline answers come back in submission order, so an answer
+    without a key takes its position, and anything that cannot be matched is an error, never a
+    guess. Inline batches must stay under 20 MB; ours are about 30 KB per tie-break request.
+    """
+
+    MAX_REQUESTS = 300
+    MAX_INLINE_BYTES = 18_000_000
+    TERMINAL = (
+        "JOB_STATE_SUCCEEDED",
+        "JOB_STATE_FAILED",
+        "JOB_STATE_CANCELLED",
+        "JOB_STATE_EXPIRED",
+    )
+
+    def __init__(self) -> None:
+        from google import genai
+
+        self.client = genai.Client(api_key=secret("GOOGLE_API_KEY"))
+
+    def submit(self, items: list[tuple[str, LLMRequest]], model: dict[str, Any]) -> str:
+        """The batch's name. A ValueError means it was refused and not created, so nothing is
+        charged: by our own checks, or by Google with a 4xx. Anything else (a 5xx, a lost
+        connection) may have created it, and propagates."""
+        from google.genai import errors, types
+
+        size = sum(len((r.system + r.user + json.dumps(r.json_schema)).encode()) for _, r in items)
+        if size > self.MAX_INLINE_BYTES:
+            raise ValueError(f"Gemini inline batch of {size:,} bytes; the limit is 20 MB")
+        src = []
+        for key, req in items:
+            try:
+                config = google_config(req, model, batch=True)
+            except (AttributeError, TypeError, ValueError) as e:
+                # e.g. a type list ("string" or null), which `response_schema` cannot express
+                raise ValueError(
+                    f"schema {req.schema_name!r} cannot be sent as response_schema: {e}"
+                ) from e
+            src.append(
+                types.InlinedRequest(contents=req.user, config=config, metadata={"key": key})
+            )
+        try:
+            return self.client.batches.create(model=model["model_version"], src=src).name
+        except errors.ClientError as e:
+            raise ValueError(f"Google refused the batch: {e}") from e
+
+    def collect(self, batch_id: str, keys: list[str]) -> list[LLMResponse] | None:
+        job = self.client.batches.get(name=batch_id)
+        state = job.state.value if job.state else None
+        if state not in self.TERMINAL:
+            return None
+        answers = (job.dest.inlined_responses if job.dest else None) or []
+        if state != "JOB_STATE_SUCCEEDED" or not answers:
+            why = f"batch {state}: {job.error.message if job.error else 'no answers'}"[:500]
+            return [LLMResponse(cache_key=k, text="", error=why) for k in keys]
+        keyed = all((a.metadata or {}).get("key") for a in answers)
+        if not keyed and len(answers) != len(keys):
+            why = f"{len(answers)} unkeyed answers for {len(keys)} requests"
+            return [LLMResponse(cache_key=k, text="", error=why) for k in keys]
+        out: list[LLMResponse] = []
+        for i, a in enumerate(answers):
+            key = (a.metadata or {}).get("key") if keyed else keys[i]
+            if key not in keys:
+                continue
+            if a.error or a.response is None:
+                msg = a.error.message if a.error else "no response"
+                out.append(LLMResponse(cache_key=key, text="", error=f"batch item: {msg}"[:500]))
+                continue
+            out.append(_google_response(key, a.response))
+        answered = {r.cache_key for r in out}
+        out += [
+            LLMResponse(cache_key=k, text="", error="no answer in the batch")
+            for k in keys
+            if k not in answered
+        ]
+        return out
 
 
 # --------------------------------------------------------------------------- Ollama (local)
@@ -316,14 +433,16 @@ class OllamaSync:
         )
 
 
-def provider_for(model: dict[str, Any]) -> AnthropicBatch | OpenAIBatch | GoogleSync | OllamaSync:
+def provider_for(
+    model: dict[str, Any],
+) -> AnthropicBatch | OpenAIBatch | GoogleBatch | GoogleSync | OllamaSync:
     match model["provider"]:
         case "anthropic":
             return AnthropicBatch()
         case "openai":
             return OpenAIBatch()
         case "google":
-            return GoogleSync()
+            return GoogleBatch() if model.get("batch_discount", 1.0) < 1.0 else GoogleSync()
         case "ollama":
             return OllamaSync(model)
     raise NotImplementedError(f"provider {model['provider']!r} lands with the arena (Milestone 2)")

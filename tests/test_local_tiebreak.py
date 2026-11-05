@@ -52,7 +52,7 @@ def test_reference_is_local_pinned_free_and_thinking():
     assert isinstance(M["seed"], int)
     # The tie-breaker is a third vendor, independent of both extractors (P.3).
     tb = model_cfg("tiebreak")
-    assert tb["provider"] == "google" and not runner.is_batch(tb)
+    assert tb["provider"] == "google" and runner.is_batch(tb)  # batch since Q-G2
     assert tb["provider"] not in {model_cfg(k)["provider"] for k in ("extractor_a", "extractor_b")}
 
 

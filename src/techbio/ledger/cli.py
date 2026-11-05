@@ -155,3 +155,38 @@ def sample(
     console.print(f"wrote {write_sample(engine, out, n)} rows to {out}")
     ex = out.with_name("exclusions.csv")
     console.print(f"wrote {write_exclusions(engine, ex)} exclusions to {ex}")
+
+
+@app.command("audit-draw")
+def audit_draw(
+    name: Annotated[
+        str, typer.Option(help="the audit's settings in config/audit.yaml")
+    ] = "bootstrap",
+) -> None:
+    """Draw the audit sample of agreed outcomes (V.2) with the seed fixed in config/audit.yaml.
+
+    Free and local. Writes the draw (pool size, seed, label and event IDs, no document text) to
+    data/audit/, and prints the counts."""
+    from techbio.core.config import settings as app_settings
+    from techbio.core.db import now
+    from techbio.ledger.audit import agreed_outcomes, draw, settings
+
+    cfg = settings(name)
+    engine = get_engine()
+    with engine.connect() as conn:
+        pool = len(agreed_outcomes(conn))
+        picked = draw(conn, cfg["n"], cfg["seed"])
+    stamp = now().strftime("%Y%m%dT%H%M%SZ")
+    out = app_settings().data_dir / "audit" / f"{name}-draw-{stamp}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "audit": name,
+        "drawn_at": stamp,
+        "settings": cfg,
+        "pool": pool,
+        "sample": [{"label_id": r["label_id"], "event_id": r["event_id"]} for r in picked],
+    }
+    out.write_text(json.dumps(record, indent=1))
+    console.print(
+        f"pool {pool} agreed outcomes; drew {len(picked)} with seed {cfg['seed']} -> {out}"
+    )

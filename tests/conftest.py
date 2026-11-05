@@ -94,6 +94,10 @@ class Fake:
         body = self.answers(model_key, req)
         if isinstance(body, Exception):  # the provider answered with an error
             return LLMResponse(key, "", error=f"{type(body).__name__}: {body}")
+        if req.schema_name == "catalyst_statements":
+            # Answers are checked against the schema; tests written before prompt v2 omit its
+            # partner list, which a real provider always returns.
+            body.setdefault("partner_mentions", [])
         return LLMResponse(key, json.dumps(body), tokens_in=1000, tokens_out=300)
 
     def submit(self, items, model):
@@ -101,7 +105,7 @@ class Fake:
         self.batches[bid] = [self._resp(k, r, r.model_key) for k, r in items]
         return bid
 
-    def collect(self, bid):
+    def collect(self, bid, keys=None):
         return self.batches[bid]
 
     def call(self, key, req, model):

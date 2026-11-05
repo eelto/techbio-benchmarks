@@ -71,8 +71,9 @@ and spend code exists in exactly one place.
 - Inspect's Gemini batch mode can't use thinking, so Gemini harness runs are synchronous unless we
   add our own batch client.
 - Meta's API has no batch endpoint, so Muse Wonder runs synchronously on every path.
-- The ledger tie-breaker is a local open-weight model (Ollama), with no batch path and no spend
-  (decisions P.1, 2026-10-31).
+- The pilot-only tie-break reference is a local open-weight model (Ollama), with no batch path and
+  no spend (decisions P.1 and P.3). The ledger tie-breaker itself, Gemini, runs on our own Google
+  batch client from 2026-11-03 (decisions C.3).
 
 **Prompt caching** covers shared instructions on every path. LitQA2 items carry no paper text in the
 official setup, so there is no shared paper context to cache (Q-G1).
@@ -180,14 +181,15 @@ tables named in the brief are marked ★. The others are additions I'm proposing
     quotes and spans are source text.
 - Statements are paired across models by event type, asset (any shared name or code) and trial.
 - Both models agree on every compared field (kind, timing window after deterministic parsing, event
-  date, phase, application kind, NCT ID, reserved fields), and reserved-field confidence ≥ τ:
-  auto-accept (`auto-agreement:<m1>+<m2>`).
+  date, phase, application kind, NCT ID, reserved fields): auto-accept
+  (`auto-agreement:<m1>+<m2>`). The models' self-ratings are stored and route nothing (V.1,
+  2026-11-05); a random audit of agreed outcomes checks this path (V.2, `config/audit.yaml`).
 - A non-reserved field disagrees: the tie-break model must pick A or B and quote the deciding
   sentence (`model-adjudicated:<m3>`), checked by the same quote rule. "Neither", or a quote that
   fails the check, goes to the queue as `tiebreak_abstained`.
 - Only one model found the statement: the tie-break decides whether it exists, unless the statement
   carries a reserved field, in which case it goes to the human queue.
-- Reserved fields go to the human queue on disagreement or confidence below τ (Q-C11). **The stop
+- Reserved fields go to the human queue on disagreement (Q-C11, V.1). **The stop
   subtype (`result_subtype`) and the stop's data trigger (`stop_data_trigger`) are reserved too**
   (operator-confirmed 2026-10-30), because together they decide scored vs void under taxonomy v1.1.
 - An accepted statement that matches more than one existing event goes to the queue as

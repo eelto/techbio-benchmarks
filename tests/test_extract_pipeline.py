@@ -177,6 +177,42 @@ def test_pipeline_routes_agree_tiebreak_queue_and_review(engine, sponsor, fake, 
         assert c.execute(select(review_queue.c.status)).scalar_one() == "closed"
 
 
+def test_agreement_on_reserved_fields_is_accepted_whatever_the_self_rating(
+    engine, sponsor, fake, tmp_path
+):
+    # V.1 (operator, 2026-11-05): two vendors agreeing is enough. The self-rating covered the whole
+    # statement, not the reserved fields, and sent agreed results to the queue. It is still stored.
+    def agree(model_key, req):
+        conf = 0.4 if model_key == "extractor_a" else 0.95
+        return {
+            "statements": [
+                st(
+                    kind="outcome",
+                    timing_text=None,
+                    result_category="met",
+                    event_date="2027-03-02",
+                    quote=OUTCOME_Q,
+                    confidence=conf,
+                )
+            ]
+        }
+
+    fake(agree)
+    add_source(
+        engine,
+        sponsor,
+        OUTCOME_HTML,
+        published=datetime(2027, 3, 2, 12, tzinfo=UTC),
+        tmp_path=tmp_path,
+    )
+    out = run_extraction(engine, execute=True)
+    assert (out["accepted"], out["queued"]) == (1, 0)
+    assert queue_size(engine).get("low_confidence", 0) == 0
+    with engine.connect() as c:
+        lab = c.execute(select(labels).where(labels.c.field == "result_category")).mappings().one()
+    assert lab["value"] == "met" and lab["reviewer_kind"] == "auto-agreement"
+
+
 def test_rerun_is_free(engine, sponsor, fake, tmp_path):
     f = fake(answers)
     add_source(
@@ -216,7 +252,7 @@ def test_quote_checks_are_logged_with_drop_rate_and_sample(engine, sponsor, fake
             (r.provider, r.batch_id is not None)
             for r in c.execute(select(completions.c.provider, completions.c.batch_id))
         }
-    assert modes == {("anthropic", True), ("openai", True), ("google", False)}
+    assert modes == {("anthropic", True), ("openai", True), ("google", True)}  # Q-G2
 
     q = summary(engine)["quote_checks"]
     assert (q["checked"], q["dropped"], q["fuzzy_kept"]) == (5, 1, 1)

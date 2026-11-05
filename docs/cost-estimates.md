@@ -37,7 +37,7 @@ provider's own model-overview page. Price plays no part.
 | mid-tier, `enabled: false` | Anthropic | `claude-opus-5-5` | 4 · 20 | 50% | Enters later on its own model-day, for the cost-per-point chart. |
 | extractor A | Anthropic | `claude-haiku-5-5` | 0.10 · 0.50 | 50% | Its tokenizer counts about 30% more tokens. |
 | extractor B | OpenAI | `gpt-6-luna` | 0.10 · 0.50 | 50% | |
-| tie-break | Google | `gemini-4-argon` | 4 · 20 from 2026-12-01 (2 · 10 until then) | none yet (our Google client has no batch path, Q-G2) | A third vendor, independent of both extractors. Back from Ornith 2026-11-02 after the pilot review (P.3). |
+| tie-break | Google | `gemini-4-argon` | 4 · 20 from 2026-12-01 (2 · 10 until then) | 50% (our Google batch client, from 2026-11-03, Q-G2) | A third vendor, independent of both extractors. Back from Ornith 2026-11-02 after the pilot review (P.3). |
 | tie-break reference, pilot only | local (Ollama) | `ornith-1.5:122b-nvfp4`, pinned by digest | 0 · 0 | none (one call at a time) | The tie-breaker from 2026-10-31 to 2026-11-02 (P.1); now a free check on the pilot's disputes, never applied. |
 
 \*Inspect's Google batch mode doesn't support thinking, so Gemini harness runs are synchronous at full
@@ -188,6 +188,32 @@ measured $0.023 per Argon tie-break at the December price. That puts the bootstr
 half that before 2026-12-01, and a Gemini batch path (Q-G2) would roughly halve it again. The scope
 check and the next prompt revision cut the disputes that reach a tie-break, so the number is
 re-measured on the pilot before the bootstrap go-ahead.
+
+**Update 2026-11-03 (C.3):** the tie-breaker now runs on Google's batch API at half price, so the
+run-3 measurement becomes about **$0.0115** per tie-break at the December price. At run 3's
+tie-break rate that is roughly **$40** ($15–$69) for the bootstrap's tie-breaks, before the prompt
+revision and the pairing fix. Prompt v2 makes every extractor answer new, so the pilot is re-measured
+($0.40 guard estimate) before the bootstrap number is settled.
+
+**Update 2026-11-03 (pilot run 7, prompt v2, $0.095):** for the 5,332 documents left, the extractors
+come to **$2.88** ($2.32–$3.49), up from $2.63 because the v2 prompt is about 27% longer. Tie-breaks
+fall from about 2,410 to about **840** (150–1,670): **about $10** ($2–$19) at the December batch
+price. That figure is provisional, because all 6 batch tie-break answers were unreadable (decisions
+C.5) and are being redone. On these numbers the bootstrap is about **$13** ($5–$22) against the $75
+cap.
+
+**Update 2026-11-05 (tie-break redo, $0.071):** the 6 tie-breaks were redone on the fixed batch
+path, and every answer was readable. The tie-break figure is now measured: about **840** tie-breaks
+(150–1,670), costing **$9.72** ($2.41–$19.18) at the December batch price. The bootstrap total is
+unchanged at about **$13** ($5–$23) against the $75 cap. The guard's $0.34 estimate assumed 10
+tie-breaks of 2,500 output tokens each. There were 6, of about 210 output tokens each (reasoning
+included), so the estimate was about 5 times the actual.
+
+**Update 2026-11-05 (bootstrap dry-run, no calls):** the tool's estimate is **$43.35** (11,731
+calls; extractors $6.24, tie-breaks $37.11) against the $75 cap. It assumes 1,200 output tokens
+per extraction and a 2,500-token tie-break for 20% of documents. The pilot measured about **$13**
+($5–$23), and that is the figure in the go-ahead request. V.1 does not change the tie-break count:
+no pilot agreement that waited in the queue had a disputed non-reserved field.
 
 ---
 
