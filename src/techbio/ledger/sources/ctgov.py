@@ -1,0 +1,257 @@
+"""ClinicalTrials.gov v2: Phase 2/3 interventional trials led by universe sponsors.
+
+CT.gov records are sponsor-submitted and public domain. Each fetched record version is a source; the
+`trials` table holds the current registry facts (design, endpoints, completion dates, stop reasons)
+that packs and event matching use. Terminated/suspended trials whose record changed inside the
+lookback become extraction inputs (stop reason -> subtype, data trigger and explanation category).
+Trials that never enrolled (withdrawn) are not events: they are recorded as exclusions instead
+(taxonomy v1.1), linked to the trial they cite when they cite one.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+
+from sqlalchemy import Engine, select, update
+
+from techbio.core.config import load_yaml
+from techbio.core.db import now, sponsors, trials
+from techbio.core.http import Fetcher, FetchResult
+from techbio.core.ids import sha256_json
+from techbio.ledger.exclusions import record_exclusion
+from techbio.ledger.names import same_company, search_term
+from techbio.ledger.store import upsert_source
+from techbio.ledger.taxonomy import exclusion_for
+
+FIELDS = (
+    "NCTId,BriefTitle,Acronym,OverallStatus,WhyStopped,PrimaryCompletionDate,"
+    "PrimaryCompletionDateType,Phase,StudyType,LeadSponsorName,EnrollmentCount,EnrollmentType,"
+    "DesignAllocation,"
+    "DesignMasking,Condition,InterventionName,InterventionType,PrimaryOutcomeMeasure,"
+    "PrimaryOutcomeTimeFrame,LastUpdatePostDate,StatusVerifiedDate"
+)
+STOPPED = {"TERMINATED", "SUSPENDED", "WITHDRAWN"}
+TWO_B = re.compile(r"\b(?:phase\s*)?(?:2b|iib)\b|pivotal|registrational", re.I)
+
+
+def in_scope_design(t: dict[str, Any]) -> bool:
+    """Taxonomy v1 / Q-B1, as far as the registry can tell: Phase 3 or Phase 2/3; or a randomized
+    Phase 2 that is called 2b/pivotal/registrational or enrolls >= 100. A withdrawn record shows an
+    enrollment of 0 (its planned size is gone), so a withdrawn randomized Phase 2 counts: it can only
+    become an exclusion, never an event."""
+    phases = set(t.get("phases") or [])
+    if "PHASE3" in phases:
+        return True
+    if "PHASE2" in phases and "PHASE1" not in phases and t.get("allocation") == "RANDOMIZED":
+        return (
+            t.get("overall_status") == "WITHDRAWN"
+            or (t.get("enrollment") or 0) >= 100
+            or bool(TWO_B.search(t.get("brief_title") or ""))
+        )
+    return False
+
+
+def parent_aliases() -> list[tuple[str, str]]:
+    return [
+        (a["lead"], a["parent"]) for a in load_yaml("sources")["ctgov"].get("parent_aliases", [])
+    ]
+
+
+def search_terms(sponsor_name: str) -> list[str]:
+    """The sponsor's own search, plus one per aliased subsidiary its search does not return."""
+    extra = [
+        a["query"]
+        for a in load_yaml("sources")["ctgov"].get("parent_aliases", [])
+        if a.get("query") and same_company(a["parent"], sponsor_name)
+    ]
+    return [search_term(sponsor_name), *extra]
+
+
+def owner(lead: str, universe: list[tuple[str, str]], aliases: list[tuple[str, str]]) -> str | None:
+    """The one universe sponsor a lead-sponsor name belongs to, or None when it names none or
+    more than one ("a BridgeBio company": BridgeBio Pharma, or the separately listed BridgeBio
+    Oncology Therapeutics)."""
+    ids = {sid for sid, name in universe if same_company(lead, name, aliases)}
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _query(term: str, since: date) -> dict[str, str]:
+    return {
+        "query.lead": term,
+        "filter.advanced": (
+            "AREA[StudyType]INTERVENTIONAL AND (AREA[Phase]PHASE2 OR AREA[Phase]PHASE3) AND "
+            f"AREA[LastUpdatePostDate]RANGE[{since.isoformat()},MAX]"
+        ),
+        "fields": FIELDS,
+        "pageSize": "200",
+    }
+
+
+def parse_study(s: dict[str, Any]) -> dict[str, Any]:
+    p = s.get("protocolSection", {})
+    ident = p.get("identificationModule", {})
+    status = p.get("statusModule", {})
+    design = p.get("designModule", {})
+    pcd = status.get("primaryCompletionDateStruct", {})
+    upd = (status.get("lastUpdatePostDateStruct") or {}).get("date")
+    return {
+        "nct_id": ident.get("nctId"),
+        "brief_title": ident.get("briefTitle"),
+        "acronym": ident.get("acronym"),
+        "lead_sponsor_name": p.get("sponsorCollaboratorsModule", {})
+        .get("leadSponsor", {})
+        .get("name"),
+        "phases": design.get("phases", []),
+        "allocation": (design.get("designInfo") or {}).get("allocation"),
+        "masking": ((design.get("designInfo") or {}).get("maskingInfo") or {}).get("masking"),
+        "enrollment": (design.get("enrollmentInfo") or {}).get("count"),
+        "enrollment_type": (design.get("enrollmentInfo") or {}).get("type"),
+        "overall_status": status.get("overallStatus"),
+        "why_stopped": status.get("whyStopped"),
+        "primary_completion_date": pcd.get("date"),
+        "primary_completion_type": pcd.get("type"),
+        "conditions": p.get("conditionsModule", {}).get("conditions", []),
+        "interventions": [
+            {"name": i.get("name"), "type": i.get("type")}
+            for i in p.get("armsInterventionsModule", {}).get("interventions", [])
+        ],
+        "primary_outcomes": [
+            {"measure": o.get("measure"), "time_frame": o.get("timeFrame")}
+            for o in p.get("outcomesModule", {}).get("primaryOutcomes", [])
+        ],
+        "last_update_posted": date.fromisoformat(upd) if upd else None,
+    }
+
+
+def stop_document(t: dict[str, Any]) -> str:
+    """Plain-text rendering of a stopped trial's registry facts, for extraction. Public domain."""
+    return "\n".join(
+        [
+            f"ClinicalTrials.gov record {t['nct_id']} ({t.get('acronym') or 'no acronym'})",
+            f"Title: {t.get('brief_title')}",
+            f"Lead sponsor: {t.get('lead_sponsor_name')}",
+            f"Phase: {', '.join(t.get('phases') or [])}",
+            f"Interventions: {', '.join(i['name'] for i in t.get('interventions') or [] if i.get('name'))}",
+            f"Conditions: {', '.join(t.get('conditions') or [])}",
+            f"Overall status: {t.get('overall_status')}",
+            f"Why stopped: {t.get('why_stopped') or '(not given)'}",
+            f"Enrollment: {t.get('enrollment')} ({t.get('enrollment_type') or 'type not given'})",
+            f"Primary completion: {t.get('primary_completion_date')} ({t.get('primary_completion_type')})",
+            f"Record last updated: {t.get('last_update_posted')}",
+        ]
+    )
+
+
+def ingest(
+    engine: Engine, fetcher: Fetcher, lookback_days: int = 365, limit: int | None = None
+) -> dict[str, int]:
+    base = load_yaml("sources")["ctgov"]["base_url"]
+    since = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
+    stats = {
+        "sponsors": 0,
+        "studies": 0,
+        "matched": 0,
+        "new_versions": 0,
+        "stopped_docs": 0,
+        "exclusions": 0,
+    }
+    with engine.connect() as conn:
+        spons = conn.execute(select(sponsors.c.sponsor_id, sponsors.c.name)).all()
+    aliases = parent_aliases()
+    universe = [(sp.sponsor_id, sp.name) for sp in spons]
+    owners: dict[str, str | None] = {}
+    for sp in spons[:limit] if limit else spons:
+        stats["sponsors"] += 1
+        seen: set[str] = set()
+        for term in search_terms(sp.name):
+            params = _query(term, since)
+            page_token = None
+            while True:
+                q = dict(params, **({"pageToken": page_token} if page_token else {}))
+                fr = fetcher.get(base, params=q, max_age=timedelta(hours=20))
+                data = fr.json()
+                for study in data.get("studies", []):
+                    stats["studies"] += 1
+                    t = parse_study(study)
+                    if not t["nct_id"] or not t["lead_sponsor_name"] or t["nct_id"] in seen:
+                        continue
+                    lead = t["lead_sponsor_name"]
+                    if lead not in owners:
+                        owners[lead] = owner(lead, universe, aliases)
+                    if owners[lead] != sp.sponsor_id:
+                        continue  # CT.gov search is fuzzy; keep only exact lead-sponsor matches
+                    seen.add(t["nct_id"])
+                    stats["matched"] += 1
+                    created = _store_trial(engine, fetcher, sp.sponsor_id, t, study)
+                    stats["new_versions"] += created[0]
+                    stats["stopped_docs"] += created[1]
+                    stats["exclusions"] += created[2]
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+    return stats
+
+
+def _store_trial(
+    engine: Engine, fetcher: Fetcher, sponsor_id: str, t: dict, study: dict
+) -> tuple[int, int, int]:
+    """Store one study record as its own source version and upsert the trials row.
+    Returns (new version, new stopped doc, new exclusion)."""
+    url = f"https://clinicaltrials.gov/study/{t['nct_id']}"
+    payload = json.dumps(study, sort_keys=True).encode()
+    digest = sha256_json(study)
+    path = fetcher.raw_dir / digest[:2] / f"{digest}.json"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    fr = FetchResult(
+        url=url,
+        status=200,
+        content=payload,
+        sha256=digest,
+        local_path=path,
+        content_type="application/json",
+        retrieved_at=now(),
+        from_cache=False,
+    )
+    in_scope_stop = t["overall_status"] in STOPPED and in_scope_design(t)
+    ex = (
+        exclusion_for(t["overall_status"], t["enrollment"], t["enrollment_type"], t["why_stopped"])
+        if in_scope_stop
+        else None
+    )
+    stopped = in_scope_stop and ex is None
+    meta = {"nct_id": t["nct_id"], "overall_status": t["overall_status"], "stopped": stopped}
+    if ex:
+        meta["excluded"] = ex.reason
+    pub = (
+        datetime.combine(t["last_update_posted"], datetime.min.time(), UTC)
+        if t["last_update_posted"]
+        else None
+    )
+    with engine.begin() as conn:
+        sid, created = upsert_source(
+            conn,
+            fr,
+            type="ctgov",
+            url=url,
+            sponsor_id=sponsor_id,
+            published_at=pub,
+            title=t["brief_title"],
+            meta=meta,
+        )
+        values = {k: v for k, v in t.items() if k != "nct_id"}
+        values.update(sponsor_id=sponsor_id, source_id=sid, updated_recorded_at=now())
+        if conn.execute(select(trials.c.nct_id).where(trials.c.nct_id == t["nct_id"])).first():
+            conn.execute(update(trials).where(trials.c.nct_id == t["nct_id"]).values(**values))
+        else:
+            conn.execute(
+                trials.insert().values(nct_id=t["nct_id"], created_recorded_at=now(), **values)
+            )
+        new_ex = bool(ex) and record_exclusion(
+            conn, source_id=sid, sponsor_id=sponsor_id, trial=t, ex=ex
+        )
+    return int(created), int(created and stopped), int(new_ex)

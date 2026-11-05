@@ -1,0 +1,34 @@
+version: 1
+sec:
+  user_agent_env: SEC_USER_AGENT        # must be a real name + email (SEC fair-access policy)
+  max_requests_per_second: 5            # SEC allows 10; we stay well under
+  tickers_url: https://www.sec.gov/files/company_tickers_exchange.json
+  submissions_url: https://data.sec.gov/submissions/CIK{cik:010d}.json
+  archives_base: https://www.sec.gov/Archives/edgar/data
+  efts_url: https://efts.sec.gov/LATEST/search-index
+universe:                               # Q-A1, Q-A2 (decided)
+  exchanges: [Nasdaq, NYSE, NYSE American]
+  sic_codes: [2834, 2835, 2836, 8731]
+  add: []                               # curated additions: list of CIKs
+  drop: []                              # curated removals: list of CIKs
+edgar:
+  lookback_days: 365                    # guidance for the next 90 days can be months old
+  forms: ["8-K", "8-K/A", "6-K", "6-K/A"]
+  eightk_items: ["7.01", "8.01", "2.02"]
+  exhibit_types: ["EX-99", "EX-99.1", "EX-99.2", "EX-99.3"]
+ctgov:
+  base_url: https://clinicaltrials.gov/api/v2/studies
+  max_requests_per_second: 5
+  phases: [PHASE2, PHASE3]
+  # Wholly owned subsidiaries whose CT.gov lead-sponsor name does not say so. Taxonomy §1 counts
+  # them as the parent. `query` adds a registry search where the parent's own search does not
+  # return them. Added 2026-11-03 from the refresh's rejected names (decisions.md C.4).
+  parent_aliases:
+    - {lead: "Merck Sharp & Dohme", parent: "Merck & Co., Inc."}          # 291 trials
+    - {lead: "Janssen", parent: "Johnson & Johnson", query: "Janssen"}     # J&J's R&D arm
+    - {lead: "Teva Branded Pharmaceutical Products", parent: "Teva Pharmaceutical Industries"}
+    - {lead: "Bausch Health Americas", parent: "Bausch Health Companies"}
+fedreg:
+  base_url: https://www.federalregister.gov/api/v1/documents.json
+  agency: food-and-drug-administration
+  max_requests_per_second: 2

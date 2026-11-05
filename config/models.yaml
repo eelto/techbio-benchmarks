@@ -1,0 +1,105 @@
+# Model registry. Code never hard-codes a model; it reads this file.
+# Selection rule (flagship): each provider's top-tier, generally available API model, taken from the
+# provider's own model-overview page. Price plays no part. Prices are USD per 1M tokens, list price,
+# checked 2026-10-30; `batch_discount` is the multiplier on our path (1.0 = no batch available).
+# Never use a tier that may train on our inputs (e.g. Meta `-contributor` models).
+version: 1
+checked_at: "2026-10-30"
+models:
+  # --- ledger extraction ---
+  extractor_a:
+    role: extractor
+    provider: anthropic
+    model_version: claude-haiku-5-5
+    price: {input: 0.10, cached_input: 0.01, output: 0.50}
+    batch_discount: 0.5
+    tokenizer_slack: 1.3        # counts ~30% more tokens than the others
+    reasoning: {effort: low}    # recorded in every cache key; extraction is reading, not reasoning
+    expected_output_tokens: 1200
+  extractor_b:
+    role: extractor
+    provider: openai
+    model_version: gpt-6-luna
+    price: {input: 0.10, cached_input: 0.01, output: 0.50}
+    batch_discount: 0.5
+    reasoning: {effort: low}
+    expected_output_tokens: 1200
+  tiebreak:
+    # Gemini 4 Argon, a third vendor. Operator decision 2026-11-02 (decisions.md P.3), P.2's
+    # fallback after the pilot tie-break review. Paid tier only: Google's unpaid tier may use
+    # inputs for training (Argon is not offered on it). Batch since 2026-11-03 (Q-G2). The batch
+    # service ignores `response_json_schema`, so batch requests send `response_schema` (a copy,
+    # without `additionalProperties`, which Google refuses there; decisions.md C.7) and have
+    # their own cache key; the pilot's synchronous answers keep theirs. Reasoning and output
+    # settings are unchanged from its pilot runs.
+    role: tiebreak
+    provider: google
+    model_version: gemini-4-argon
+    # 2.00/10.00 until 2026-12-01, then 4.00/20.00. Estimates use the higher price. Cached input
+    # is 0.20 from 2026-12-01 (Google's price page, checked 2026-11-03; was 0.40 here).
+    price: {input: 4.00, cached_input: 0.20, output: 20.00}
+    batch_discount: 0.5
+    reasoning: {thinking_level: MEDIUM}
+    expected_output_tokens: 2500
+  tiebreak_reference:
+    # Pilot only (`ledger extract --compare-tiebreak`): the same disputes, as a free check on the
+    # tie-breaker. Its choices are reported and never applied. Ornith 1.5 122B, open weights
+    # (NVFP4), on the operator's local Ollama 0.40.5: the tie-breaker from 2026-10-31 to 2026-11-02
+    # (P.1). No batch path: one call at a time. Pinned by the manifest digest Ollama reports in
+    # /api/tags; the provider refuses to run if the server has other weights under this tag.
+    role: tiebreak_reference
+    provider: ollama
+    model_version: "ornith-1.5:122b-nvfp4@sha256:f0df8c3e9efc1c5a583b03d4885a55a9695fef5a96e5eebca1e6abeb65ae3e0a"
+    endpoint: http://127.0.0.1:11435
+    price: {input: 0.0, cached_input: 0.0, output: 0.0}
+    batch_discount: 1.0
+    reasoning: {think: true}    # thinking off returned "neither" or nothing on every probe
+    seed: 20261031
+    context_tokens: 32768
+    max_output_tokens: 8000     # an answer that hits the cap is an error and goes to the queue
+    expected_output_tokens: 2500
+    output_tokens_per_s: 80     # measured 2026-10-31 (M5 Max)
+  # --- arena + harness flagships (enabled at their milestones) ---
+  astra:
+    role: flagship
+    provider: openai
+    model_version: gpt-6-astra
+    price: {input: 10.00, cached_input: 1.00, output: 50.00}
+    batch_discount: 0.5
+  fable:
+    role: flagship
+    provider: anthropic
+    model_version: claude-fable-5-1
+    price: {input: 10.00, cached_input: 1.00, output: 50.00}
+    batch_discount: 0.5
+  argon:
+    role: flagship
+    provider: google
+    model_version: gemini-4-argon
+    price: {input: 4.00, cached_input: 0.40, output: 20.00}
+    batch_discount: 1.0
+  grok:
+    role: flagship
+    provider: xai
+    model_version: grok-4.7
+    price: {input: 2.00, cached_input: 0.50, output: 6.00}
+    batch_discount: 0.8
+  muse:
+    role: flagship
+    provider: meta
+    model_version: muse-wonder-1.0
+    price: {input: 4.00, cached_input: 4.00, output: 20.00}   # secondary sources; unverified
+    batch_discount: 1.0
+  glm:
+    role: flagship_open_weight
+    provider: together
+    model_version: zai-org/GLM-5.3
+    price: {input: 1.40, cached_input: 1.40, output: 4.40}
+    batch_discount: 0.5
+  opus:
+    role: midtier
+    enabled: false              # enters later for the cost-per-point chart
+    provider: anthropic
+    model_version: claude-opus-5-5
+    price: {input: 4.00, cached_input: 0.40, output: 20.00}
+    batch_discount: 0.5

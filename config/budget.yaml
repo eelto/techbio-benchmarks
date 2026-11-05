@@ -1,0 +1,19 @@
+# Hard caps (USD). The provider console limits are the backstop; these per-run caps are the first line.
+# Every paid job is dry-run by default and needs --execute plus an approval (standing or explicit).
+version: 1
+monthly_operating_cap_usd: 150          # ledger + arena jobs (operator, 2026-10-30, O.3)
+jobs:
+  ledger_daily:      {cap_usd: 3.00}
+  ledger_extract:    {cap_usd: 3.00}    # ad-hoc extraction runs; above $3 needs an explicit approval
+  ledger_bootstrap:  {cap_usd: 75.00}    # needs its own go-ahead after the dry-run
+  ledger_backfill:   {cap_usd: 150.00}
+  arena_round:       {cap_usd: 60.00}   # operator, 2026-10-30 (O.3)
+  harness_pilot:     {cap_usd: 100.00}  # operator, 2026-10-30 (O.3)
+standing_approvals:
+  - id: sa-2026-10-30-ingest
+    scope: [ledger_daily, ledger_extract, ledger_resolve]
+    per_day_usd: 3.00
+    per_month_usd: 40.00                # Q-M3 monthly part: default, pending
+    approved_by: operator
+    approved_on: "2026-10-30"
+    note: "Standing approval for ingestion and resolution, from the operator's Step-1 decisions."
